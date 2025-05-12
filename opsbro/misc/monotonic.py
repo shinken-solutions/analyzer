@@ -141,11 +141,18 @@ except AttributeError:
             
             else:
                 try:
-                    # NOTE: on alpine linux 2.7, there is a issue with find(c) that is giving back
-                    # the full path instead of just the lib name, so use os.path.basename() to strip it
-                    clock_gettime = ctypes.CDLL(os.path.basename(ctypes.util.find_library('c')), use_errno=True).clock_gettime
-                except AttributeError:
-                    clock_gettime = ctypes.CDLL(os.path.basename(ctypes.util.find_library('rt')), use_errno=True).clock_gettime
+                    clib_path = ctypes.util.find_library('c')
+                    if clib_path:
+                        # NOTE: on alpine linux 2.7, there is a issue with find(c) that is giving back
+                        # the full path instead of just the lib name, so use os.path.basename() to strip it
+                        clib_path = os.path.basename(clib_path)
+                    # NOTE: if none, will get libc :)
+                    clock_gettime = ctypes.CDLL(clib_path, use_errno=True).clock_gettime
+                except (RuntimeError, AttributeError):  # Exception can very based on system and python compilation
+                    rt_path = ctypes.util.find_library('rt')
+                    if rt_path is None:
+                        raise Exception('The system rt librairy is missing, please install it')
+                    clock_gettime = ctypes.CDLL(os.path.basename(rt_path), use_errno=True).clock_gettime
                 
                 
                 class timespec(ctypes.Structure):
@@ -178,5 +185,8 @@ except AttributeError:
             if monotonic() - monotonic() > 0:
                 raise ValueError('monotonic() is not monotonic!')
         
-        except Exception:
-            raise RuntimeError('no suitable implementation for this system')
+        except Exception as exp:
+            from opsbro.log import logger
+            
+            logger.debug('DEV-WARNING: No suitable implementation of a monotonic clock for this system (%s:%s), using standard time' % (type(exp), exp))
+            monotonic = time.time

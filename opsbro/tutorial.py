@@ -1,7 +1,8 @@
 import os
-import json
+import codecs
 
-from opsbro.log import LoggerFactory
+from .log import LoggerFactory
+from .jsonmgr import jsoner
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('monitoring')
@@ -18,10 +19,10 @@ class Tutorial(object):
     
     
     def get_tutorial_data(self):
-        with open(self.tutorial_data_path, 'r') as f:
+        with codecs.open(self.tutorial_data_path, 'r', 'utf8') as f:
             buf = f.read()
             
-            data = json.loads(buf, encoding='utf8')
+            data = jsoner.loads(buf, encoding='utf8')
             return data
     
     

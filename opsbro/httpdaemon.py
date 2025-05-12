@@ -1,12 +1,17 @@
-import json
-from opsbro.misc.bottle import run, request, abort, error, redirect, response, gserver
-from opsbro.misc.bottle import route as bottle_route
+import traceback
+
+from .misc.bottle import run, request, abort, error, redirect, response, gserver
+from .misc.bottle import route as bottle_route
 import opsbro.misc.bottle as bottle
 
-bottle.debug(True)
+bottle.debug(False)
 
-from opsbro.log import logger
+from .log import logger, LoggerFactory
+from .jsonmgr import jsoner
 
+http_logger = LoggerFactory.create_logger('http_errors')
+
+# Global: keep a trace of the exported functions called by the routes
 exported_functions = {}
 
 
@@ -77,12 +82,31 @@ class ExternalHttpProtectionLookup(object):
         return _externalhttp_protection
 
 
+# We want the http daemon to be accessible from everywhere without issue
+class LogErrors(object):
+    name = 'log_errors'
+    api = 2
+    
+    
+    def apply(self, fn, context):
+        def _log_errors(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                err = traceback.format_exc()
+                http_logger.error('The request %s/%s did raise an error: %s' % (request, context, err))
+                raise
+        
+        
+        return _log_errors
+
+
 # This class is the http daemon main interface
 # in a singleton mode so you can easily register new uri from other
 # part of the code, mainly by adding new route to bottle
 class HttpDaemon(object):
     def __init__(self):
-        pass
+        self.__hook_errors()
     
     
     def run(self, addr, port, socket_path):
@@ -93,6 +117,9 @@ class HttpDaemon(object):
         # Socket access got a root access, a direct one :)
         # but in the external should be an autorization
         bapp.install(ExternalHttpProtectionLookup())
+
+        # When call does crash, log them
+        bapp.install(LogErrors())
         
         if socket_path:
             # Will lock for in this
@@ -103,16 +130,38 @@ class HttpDaemon(object):
             bapp.run(host=addr, port=port, server='cherrypy', numthreads=64)  # 256?
     
     
-    # Some default URI
-    @error(404)
-    def err404(error):
-        return ''
-    
-    
-    # Some default URI    
-    @error(401)
-    def err401(error):
-        return ''
+    def __hook_errors(self):
+        # Some default URI
+        @error(404)
+        def err404(error):
+            return ''
+        
+        
+        # Some default URI
+        @error(401)
+        def err401(error):
+            return ''
+        
+        
+        @error(500)
+        def err500(error):
+            return_value = None
+            error_msg = getattr(error, 'text', error._status_line)
+            request_url = repr(request.url)
+            logger.error("ERROR at [%s] msg : %s" % (request_url, error_msg))
+            logger.error("FULL Error: %s" % traceback.format_exc())
+            if error.traceback:
+                first_line = True
+                for line_stack in error.traceback.splitlines():
+                    if first_line:
+                        logger.error("ERROR stack : %s" % line_stack)
+                        first_line = False
+                    else:
+                        logger.error("%s" % line_stack)
+            # is it a json?
+            if response and response.content_type == 'application/json':
+                return_value = jsoner.dumps(error_msg)
+            return return_value
     
     
     @http_export('/')
@@ -124,7 +173,7 @@ class HttpDaemon(object):
     @http_export('/api/')
     def list_api():
         response.content_type = 'application/json'
-        return json.dumps(exported_functions.values())
+        return jsoner.dumps(exported_functions.values())
 
 
 httpdaemon = HttpDaemon()

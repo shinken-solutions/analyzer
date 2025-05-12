@@ -5,8 +5,10 @@ from .characters import CHARACTERS
 from .misc.lolcat import lolcat
 from .topic import TOPICS, TOPICS_LABELS, TOPICS_LABEL_BANNER, TOPICS_COLORS, TOPICS_SUB_TITLES, MAX_TOPICS_LABEL_SIZE, TOPICS_COLORS_RANDOM_VALUES_LOOP
 from .log import sprintf
+from .cli_display import get_terminal_size
 
-VERSION = '0.4b1'
+VERSION = '0.5'
+PROJECT_NAME = 'opsbro'
 
 _txt_topics = u' Topics:\n%s' % ('\n'.join([' - %s (%s)' % (TOPICS_LABELS[t].ljust(MAX_TOPICS_LABEL_SIZE), TOPICS_SUB_TITLES[t]) for t in TOPICS]))
 
@@ -78,9 +80,9 @@ line_after = banner_lines[_idx + 1].rstrip()
 def _lolify(s):
     l = []
     chunk_size = 5
-    for i in xrange(0, len(s), chunk_size):
+    for i in range(0, len(s), chunk_size):  # note: python3 do not have xrange
         chunk = s[i:i + chunk_size]
-        _color_idx = TOPICS_COLORS_RANDOM_VALUES_LOOP.next()
+        _color_idx = next(TOPICS_COLORS_RANDOM_VALUES_LOOP)  # Python 3 do nto have .next()
         l.append(lolcat.get_line(u'%s' % chunk, _color_idx, spread=3))
     return u''.join(l)
 
@@ -106,12 +108,25 @@ banner_lines[_idx + 1] = line_after
 
 _idx_topics = 5
 
-banner_lines[_idx_topics] += '  %sOps%s*%sBro%s goal: solve most common use cases of theses %s%s6%s Topics' % (_BLUE, _RESET, _RED, _RESET, _BOLD, _MAGENTA, _RESET)
+try:
+    _, terminal_width = get_terminal_size()
+except:
+    terminal_width = 999
+
+banner_lines[_idx_topics - 1] += '  %sOps%s*%sBro%s solve common' % (_BLUE, _RESET, _RED, _RESET)
+banner_lines[_idx_topics] += '  use cases of %s%s6%s Topics:' % (_BOLD, _MAGENTA, _RESET)
 for (i, topic) in enumerate(TOPICS):
     _color_id = TOPICS_COLORS[topic]
     topic_label = lolcat.get_line(TOPICS_LABEL_BANNER[topic].ljust(MAX_TOPICS_LABEL_SIZE), _color_id, spread=None)
-    topic_sub_text = sprintf(TOPICS_SUB_TITLES[topic], color='grey', end='')
-    suffix = '  %s %s %s' % (topic_label, CHARACTERS.arrow_left, topic_sub_text)
+    topic_sub_text = TOPICS_SUB_TITLES[topic]
+    # We want to have a responsive sub title that do not print outside the terminal
+    # NOTE: 28 = bro width
+    #       5  = space and arrow
+    max_topic_sub_text_len = terminal_width - MAX_TOPICS_LABEL_SIZE - 28 - 5
+    if len(topic_sub_text) > max_topic_sub_text_len:
+        topic_sub_text = topic_sub_text[:max_topic_sub_text_len - 1] + sprintf(CHARACTERS.three_dots, color='yellow', end='')
+    colored_topic_sub_text = sprintf(topic_sub_text, color='grey', end='')
+    suffix = '  %s %s %s' % (topic_label, CHARACTERS.arrow_left, colored_topic_sub_text)
     banner_lines[_idx_topics + i + 1] += suffix
 
 _idx_project_home = _idx_topics + len(TOPICS) + 2
@@ -123,7 +138,6 @@ _idx_main_devs = _idx_project_home + 1
 _project_main_devs = banner_lines[_idx_main_devs]
 _project_main_devs += u'  By     : %s' % MAIN_DEVS
 banner_lines[_idx_main_devs] = _project_main_devs
-
 
 ######### Gun RAY
 '''

@@ -1,6 +1,0 @@
-detector:
-    add_groups:
-        - openvz
-    apply_if: "file_exists('/proc/vz')"
-    interval: "10s"
-

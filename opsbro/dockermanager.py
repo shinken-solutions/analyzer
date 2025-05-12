@@ -3,19 +3,20 @@ import json
 import time
 import os
 
-from opsbro.log import LoggerFactory
-from opsbro.threadmgr import threader
-from opsbro.httpdaemon import http_export, response
-from opsbro.misc.cgroups import cgroupmgr
-from opsbro.unixclient import get_json, get_request_errors
+from .log import LoggerFactory
+from .threadmgr import threader
+from .misc.cgroups import cgroupmgr
+from .unixclient import get_json, get_request_errors
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('docker')
 
+DOCKER_SOCKET_PATH = '/var/run/docker.sock'
+
 
 def lower_dict(d):
     nd = {}
-    for k, v in d.iteritems():
+    for k, v in d.items():
         nk = k.lower()
         if isinstance(v, dict):  # yes, it's recursive :)
             v = lower_dict(v)
@@ -68,9 +69,11 @@ class DockerManager(object):
     
     
     def connect(self):
+        if not os.path.exists(DOCKER_SOCKET_PATH):  # Quick exit if the socket is not even exiting
+            return
         if not self.con:
             try:
-                self.con = get_json('/version', local_socket='/var/run/docker.sock')
+                self.con = get_json('/version', local_socket=DOCKER_SOCKET_PATH)
             except get_request_errors():  # cannot connect
                 self.con = None
                 logger.debug('Cannot connect to docker')
@@ -89,8 +92,8 @@ class DockerManager(object):
     
     def load_container(self, _id):
         try:
-            inspect = get_json('/containers/%s/json' % _id, local_socket='/var/run/docker.sock')
-        except get_request_errors(), exp:
+            inspect = get_json('/containers/%s/json' % _id, local_socket=DOCKER_SOCKET_PATH)
+        except get_request_errors() as exp:
             self.connect()
             return
         c = lower_dict(inspect)
@@ -102,7 +105,7 @@ class DockerManager(object):
         if not self.con:
             return
         try:
-            conts = get_json('/containers/json', local_socket='/var/run/docker.sock')
+            conts = get_json('/containers/json', local_socket=DOCKER_SOCKET_PATH)
         except get_request_errors():
             self.connect()
             return
@@ -118,7 +121,7 @@ class DockerManager(object):
         if not self.con:
             return
         try:
-            self.images = get_json('/images/json', local_socket='/var/run/docker.sock')
+            self.images = get_json('/images/json', local_socket=DOCKER_SOCKET_PATH)
         except get_request_errors():
             self.connect()
             return
@@ -129,7 +132,7 @@ class DockerManager(object):
         stats = cgroupmgr.get_containers_metrics(cids)
         
         now = time.time()
-        for (cid, nst) in stats.iteritems():
+        for (cid, nst) in stats.items():
             c_stats = self.stats.get(cid, {})
             if self.last_stats != 0:
                 diff = now - self.last_stats
@@ -181,7 +184,7 @@ class DockerManager(object):
         if self.con is None:
             return
         images = {}
-        for (cid, cont) in self.containers.iteritems():
+        for (cid, cont) in self.containers.items():
             # avoid containers with no stats, it's not a good thing here :)
             if cid not in self.stats:
                 continue
@@ -192,13 +195,13 @@ class DockerManager(object):
         
         img_stats = {}
         # print "IMAGES", images
-        for (img, cids) in images.iteritems():
+        for (img, cids) in images.items():
             # print 'IMAGE', img
             # print cids
             s = {}
             img_stats[img] = s
             for cid in cids:
-                for (k, d) in self.stats[cid].iteritems():
+                for (k, d) in self.stats[cid].items():
                     # if the first value, keep it as a whole
                     if s.get(k, None) is None:
                         s[k] = d
@@ -215,7 +218,7 @@ class DockerManager(object):
         # Now be sure to have updated images
         self.load_images()
         
-        for (img_id, s) in img_stats.iteritems():
+        for (img_id, s) in img_stats.items():
             img = None
             for d in self.images:
                 if d['Id'] == img_id:
@@ -253,9 +256,9 @@ class DockerManager(object):
                 continue
             now = int(time.time())
             try:
-                evts = get_json("/events", local_socket='/var/run/docker.sock', params={'until': now, 'since': now - 1},
+                evts = get_json("/events", local_socket=DOCKER_SOCKET_PATH, params={'until': now, 'since': now - 1},
                                 multi=True)
-            except Exception, exp:
+            except Exception as exp:
                 logger.debug('cannot get docker events: %s' % exp)
                 time.sleep(1)
                 continue
@@ -286,6 +289,8 @@ class DockerManager(object):
     # main method to export http interface. Must be in a method that got
     # a self entry
     def export_http(self):
+        from .httpdaemon import http_export, response
+        
         @http_export('/docker/')
         @http_export('/docker')
         def get_docker():
@@ -313,7 +318,7 @@ class DockerManager(object):
             response.content_type = 'application/json'
             if self.con is None:
                 return json.dumps(None)
-            imgs = get_json('/images/json', local_socket='/var/run/docker.sock')
+            imgs = get_json('/images/json', local_socket=DOCKER_SOCKET_PATH)
             r = [lower_dict(d) for d in imgs]
             return json.dumps(r)
         
@@ -323,7 +328,7 @@ class DockerManager(object):
             response.content_type = 'application/json'
             if self.con is None:
                 return json.dumps(None)
-            imgs = get_json('/images/json', local_socket='/var/run/docker.sock')
+            imgs = get_json('/images/json', local_socket=DOCKER_SOCKET_PATH)
             for d in imgs:
                 if d['Id'] == _id:
                     return json.dumps(lower_dict(d))

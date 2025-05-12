@@ -1,9 +1,9 @@
-import json
-
 from opsbro.module import ConnectorModule
 from opsbro.parameters import StringParameter, BoolParameter
 from opsbro.gossip import gossiper
 from opsbro.collectormanager import collectormgr
+from opsbro.jsonmgr import jsoner
+from opsbro.util import bytes_to_unicode
 
 
 class ShinkenEnterpriseModule(ConnectorModule):
@@ -20,21 +20,20 @@ class ShinkenEnterpriseModule(ConnectorModule):
         enabled = self.get_parameter('enabled')
         if not enabled:
             return
-        with gossiper.groups_lock:
-            groups = gossiper.groups[:]
+        groups = gossiper.groups  # no need to copy, the group pointer is in read only
         self.logger.info('Pushing back ours groups and discovery informations to Shinken Enterprise')
         
         collectors_data = {}
-        for (ccls, e) in collectormgr.collectors.iteritems():
+        for (ccls, e) in collectormgr.collectors.items():
             cname, c = collectormgr.get_collector_json_extract(e)
             collectors_data[cname] = c
-            
+        
         # In groups=> templates, we do not want : and . in the names
         _mapping = {':': '--', '.': '--'}
         use_value = ','.join(groups)
-        for (k, v) in _mapping.iteritems():
+        for (k, v) in _mapping.items():
             use_value = use_value.replace(k, v)
-
+        
         payload = {
             '_AGENT_UUID': gossiper.uuid,
             'use'        : use_value,
@@ -66,7 +65,7 @@ class ShinkenEnterpriseModule(ConnectorModule):
         # Timezone
         timezone = collectors_data.get('timezone', {}).get('results', {}).get('timezone', '')
         if timezone:
-            payload['_TIMEZONE'] = timezone.decode('utf8', 'ignore')
+            payload['_TIMEZONE'] = bytes_to_unicode(timezone)
         
         cpucount = system_results.get('cpucount', '')
         if cpucount:
@@ -107,25 +106,10 @@ class ShinkenEnterpriseModule(ConnectorModule):
         if volumes:
             payload['_VOLUMES'] = volumes
         
+
         file_result = self.get_parameter('file_result')
+        self.logger.info('Writing file result to : %s' % file_result)
         if file_result:
             f = open(file_result, 'w')
-            f.write(json.dumps(payload, indent=4))
+            f.write(jsoner.dumps(payload, indent=4))
             f.close()
-            
-            
-            
-        # try:
-        #    self.logger.info('Sending back discovery data to shinken at %s' % enterprise_callback_uri)
-        #    conn = httplib.HTTPConnection(enterprise_callback_uri)
-        #    conn.set_debuglevel(1)
-        
-        #    params = json.dumps({'host': payload})
-        #    headers = {'User-agent': 'agent', 'Accept': 'application/json'}
-        #    conn.request('PUT', '/v1/hosts/', params, headers)
-        
-        #    response = conn.getresponse()
-        #    print response.status, response.reason
-        #    conn.close()
-        # except Exception, exp:
-        #    self.logger.error('Cannot send back discovery data to shinken: %s' % exp)

@@ -1,0 +1,6 @@
+detector:
+    add_groups:
+        - docker-host
+    apply_if: "file_exists('/var/run/docker.sock')"
+    interval: "3600s"
+

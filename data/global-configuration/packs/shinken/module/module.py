@@ -2,9 +2,7 @@ import os
 import glob
 import time
 import shutil
-import hashlib
-import subprocess
-import json
+import codecs
 
 from opsbro.module import ConnectorModule
 from opsbro.parameters import StringParameter, BoolParameter
@@ -14,6 +12,8 @@ from opsbro.stop import stopper
 from opsbro.detectormgr import detecter
 from opsbro.gossip import gossiper
 from opsbro.kv import kvmgr
+from opsbro.jsonmgr import jsoner
+from opsbro.util import exec_command, get_sha1_hash, PY3
 
 
 class ShinkenModule(ConnectorModule):
@@ -37,6 +37,8 @@ class ShinkenModule(ConnectorModule):
         self.reload_command = ''
         self.monitoring_tool = 'shinken'
         self.external_command_file = '/var/lib/shinken/shinken.cmd'
+        self.enabled = False
+        self.export_states_uuids = set()
     
     
     def prepare(self):
@@ -45,10 +47,19 @@ class ShinkenModule(ConnectorModule):
         self.reload_command = self.get_parameter('reload_command')
         self.monitoring_tool = self.get_parameter('monitoring_tool')
         self.external_command_file = self.get_parameter('external_command_file')
+        self.enabled = self.get_parameter('enabled')
+        # Simulate that we are a new node, to always export our states at startup
+        self.node_changes.append(('new-node', gossiper.uuid))
         # register to node events
         pubsub.sub('new-node', self.new_node_callback)
         pubsub.sub('delete-node', self.delete_node_callback)
         pubsub.sub('change-node', self.change_node_callback)
+    
+    
+    def get_info(self):
+        state = 'STARTED' if self.enabled else 'DISABLED'
+        log = ''
+        return {'configuration': self.get_config(), 'state': state, 'log': log}
     
     
     def launch(self):
@@ -56,16 +67,22 @@ class ShinkenModule(ConnectorModule):
     
     
     def new_node_callback(self, node_uuid=None):
+        if not self.enabled:
+            return
         self.node_changes.append(('new-node', node_uuid))
         self.regenerate_flag = True
     
     
     def delete_node_callback(self, node_uuid=None):
+        if not self.enabled:
+            return
         self.node_changes.append(('delete-node', node_uuid))
         self.regenerate_flag = True
     
     
     def change_node_callback(self, node_uuid=None):
+        if not self.enabled:
+            return
         self.node_changes.append(('change-node', node_uuid))
         self.regenerate_flag = True
     
@@ -74,32 +91,42 @@ class ShinkenModule(ConnectorModule):
         return 'Agent-%s' % cname.split('/')[-1]
     
     
-    def export_states_into_shinken(self, nuuid):
+    def export_all_states(self):
         p = self.external_command_file
         if not os.path.exists(p):
-            self.logger.info('Shinken command file %s is missing, skipping node information export' % p)
+            self.logger.warning('Shinken command file %s is missing, skipping node information export' % p)
             return
+        
+        # Now the nagios is ready, we can export our states
+        for nid in self.export_states_uuids:
+            self.__export_states_into_shinken(nid)  # update it's inner checks states
+        self.export_states_uuids.clear()
+    
+    
+    def __export_states_into_shinken(self, nuuid):
+        p = self.external_command_file
         
         v = kvmgr.get_key('__health/%s' % nuuid)
         if v is None or v == '':
             self.logger.error('Cannot access to the checks list for', nuuid)
             return
         
-        lst = json.loads(v)
+        lst = jsoner.loads(v)
         for cname in lst:
             v = kvmgr.get_key('__health/%s/%s' % (nuuid, cname))
             if v is None:  # missing check entry? not a real problem
                 continue
-            check = json.loads(v)
+            check = jsoner.loads(v)
             self.logger.debug('CHECK VALUE %s' % check)
             try:
-                f = open(p, 'a')
+                mode = 'w' if PY3 else 'a'  # codecs.open got issue with a in python 3
+                f = codecs.open(p, mode, encoding="utf-8")
                 cmd = '[%s] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s\n' % (int(time.time()), nuuid, self.sanatize_check_name(cname), check['state_id'], check['output'])
                 self.logger.debug('SAVING COMMAND %s' % cmd)
                 f.write(cmd)
                 f.flush()
                 f.close()
-            except Exception, exp:
+            except Exception as exp:
                 self.logger.error('Shinken command file write fail: %s' % exp)
                 return
     
@@ -115,7 +142,7 @@ class ShinkenModule(ConnectorModule):
         if not os.path.exists(self.cfg_path):
             try:
                 os.mkdir(self.cfg_path)
-            except Exception, exp:
+            except Exception as exp:
                 self.logger.error('Cannot create shinken directory at %s : %s', self.cfg_path, str(exp))
                 return
         self.logger.debug('Generating cfg/sha file for node %s' % n)
@@ -131,7 +158,7 @@ class ShinkenModule(ConnectorModule):
                 f = open(shap, 'r')
                 old_sha_value = f.read().strip()
                 f.close()
-            except Exception, exp:
+            except Exception as exp:
                 self.logger.error('Cannot read old sha file value at %s: %s' % (shap, exp))
         
         tpls = n.get('groups', [])[:]  # make a copy, because we will modify it
@@ -141,7 +168,7 @@ class ShinkenModule(ConnectorModule):
         tpls.insert(0, 'agent,opsbro')
         
         # get checks names and sort them so file il always the same
-        cnames = n.get('checks', {}).keys()
+        cnames = list(n.get('checks', {}).keys())  # list() for python3
         cnames.sort()
         
         # Services must be purely passive, and will only trigger once
@@ -173,7 +200,7 @@ class ShinkenModule(ConnectorModule):
             max_check_attempts              2
         \n}\n
         \n%s\n''' % (n['uuid'], n['name'], n['addr'], use_value, '\n'.join([buf_service % (n['uuid'], self.sanatize_check_name(cname)) for cname in cnames]))
-        buf_sha = hashlib.sha1(buf).hexdigest()
+        buf_sha = get_sha1_hash(buf)
         
         # if it the same as before?
         self.logger.debug('COMPARING OLD SHA/NEWSHA= %s   %s' % (old_sha_value, buf_sha))
@@ -194,7 +221,7 @@ class ShinkenModule(ConnectorModule):
             fsha.write(buf_sha)
             fsha.close()
             shutil.move(shaptmp, shap)
-        except IOError, exp:
+        except IOError as exp:
             try:
                 fcfg.close()
             except:
@@ -218,12 +245,12 @@ class ShinkenModule(ConnectorModule):
                 os.unlink(cfgp)
                 # We did remove a file, reload shinken so
                 self.reload_flag = True
-            except IOError, exp:
+            except IOError as exp:
                 self.logger.error('Cannot remove deprecated file %s' % cfgp)
         if os.path.exists(shap):
             try:
                 os.unlink(shap)
-            except IOError, exp:
+            except IOError as exp:
                 self.logger.error('Cannot remove deprecated file %s' % shap)
     
     
@@ -253,6 +280,11 @@ class ShinkenModule(ConnectorModule):
         while detecter.did_run == False:
             time.sleep(1)
         
+        self.enabled = self.get_parameter('enabled')
+        while not self.enabled:
+            self.enabled = self.get_parameter('enabled')
+            time.sleep(1)
+        
         if self.cfg_path is not None:
             self.clean_cfg_dir()
             # First look at all nodes in the gossip ring and regerate them
@@ -263,16 +295,22 @@ class ShinkenModule(ConnectorModule):
                     continue
                 self.generate_node_file(n)
         
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             self.logger.debug('Shinken loop, regenerate [%s]' % self.regenerate_flag)
             
+            # If we can, export all states into the nagios/shinken daemon as passive checks
+            self.export_all_states()
+            
             time.sleep(1)
+            
             # If not initialize, skip loop
             if self.cfg_path is None or gossiper is None:
                 continue
-            # If nothing to do, skip it too
+            
+            # If nothing to do in configuration, skip it too
             if not self.regenerate_flag:
                 continue
+            
             self.logger.info('Shinken callback raised, managing events: %s' % self.node_changes)
             # Set that we will manage all now
             self.regenerate_flag = False
@@ -285,22 +323,24 @@ class ShinkenModule(ConnectorModule):
                         continue
                     self.logger.info('Manage new node %s' % n)
                     self.generate_node_file(n)
-                    self.export_states_into_shinken(nid)  # update it's inner checks states
+                    self.export_states_uuids.add(nid)
                 elif evt == 'delete-node':
                     self.logger.info('Removing deleted node %s' % nid)
                     self.clean_node_files(nid)
                 elif evt == 'change-node':
                     self.logger.info('A node did change, updating its configuration. Node %s' % nid)
                     self.generate_node_file(n)
-                    self.export_states_into_shinken(nid)  # update it's inner checks states
+                    self.export_states_uuids.add(nid)
             
             # If we need to reload and have a reload commmand, do it
             if self.reload_flag and self.reload_command:
                 self.reload_flag = False
-                p = subprocess.Popen(self.reload_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, preexec_fn=os.setsid)
-                stdout, stderr = p.communicate()
+                rc, stdout, stderr = exec_command(self.reload_command)
                 stdout += stderr
-                if p.returncode != 0:
+                if rc != 0:
                     self.logger.error('Cannot reload monitoring daemon: %s' % stdout)
-                else:
-                    self.logger.info('Monitoring daemon reload: OK')
+                    return
+                
+                self.logger.info('Monitoring daemon reload: OK')
+                payload = {'type': 'shinken-restart'}
+                gossiper.stack_event_broadcast(payload)

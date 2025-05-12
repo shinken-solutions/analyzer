@@ -99,7 +99,7 @@ class CgroupMgr(object):
             return ''
         with open("/proc/mounts") as fp:
             mounts = map(lambda x: x.split(), fp.read().splitlines())
-        cgroup_mounts = filter(lambda x: x[2] == "cgroup", mounts)
+        cgroup_mounts = list(filter(lambda x: x[2] == "cgroup", mounts))
         if len(cgroup_mounts) == 0:
             return ''
         # Old cgroup style
@@ -131,7 +131,7 @@ class CgroupMgr(object):
                 stat_file = self._get_cgroup_file(cgroup["cgroup"], cid, cgroup['file'])
                 stats = self._parse_cgroup_file(stat_file)
                 if stats:
-                    for key, (dd_key, metric_type, rate_f) in cgroup['metrics'].iteritems():
+                    for key, (dd_key, metric_type, rate_f) in cgroup['metrics'].items():
                         if key in stats:  # and (common_metric or collect_uncommon_metrics):
                             v = {'type'  : metric_type, 'scope': cgroup["cname"], 'mname': key,
                                  'value' : int(stats[key]),

@@ -1,6 +1,0 @@
-generator:
-    if_group: haproxy
-    path:     /etc/haproxy/haproxy.cfg
-    template: haproxy.cfg
-    command:  "/etc/init.d/haproxy reload"
-

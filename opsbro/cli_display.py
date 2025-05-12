@@ -13,6 +13,7 @@ from .log import cprint, logger, sprintf
 from .characters import CHARACTERS
 from .yamlmgr import yamler
 from .misc.lolcat import lolcat
+from .colorpalette import colorpalette, COLOR_PACK_CITRON_TO_VIOLET
 
 
 # raw_title means do not format it, use it's own color
@@ -84,7 +85,7 @@ def __assert_pname_in_obj(pname, o, parameters_file_path):
 def yml_parameter_get(parameters_file_path, parameter_name, file_display=None):
     if file_display is None:
         file_display = parameters_file_path
-    o = yamler.get_object_from_parameter_file(parameters_file_path)
+    o = yamler.get_object_from_parameter_file(parameters_file_path, with_comments=True)  # in CLI comments are importants
     
     # Error if the parameter is not present
     __assert_pname_in_obj(parameter_name, o, parameters_file_path)
@@ -110,7 +111,7 @@ def yml_parameter_get(parameters_file_path, parameter_name, file_display=None):
 def __get_and_assert_valid_to_yaml_value(str_value):
     try:
         python_value = yamler.loads('%s' % str_value)
-    except Exception, exp:
+    except Exception as exp:
         err = 'Cannot load the value %s as a valid parameter: %s' % (str_value, exp)
         logger.error(err)
         raise Exception(err)
@@ -141,7 +142,7 @@ def yml_parameter_add(parameters_file_path, parameter_name, str_value, file_disp
         file_display = parameters_file_path
     
     # First get the value
-    o = yamler.get_object_from_parameter_file(parameters_file_path)
+    o = yamler.get_object_from_parameter_file(parameters_file_path, with_comments=True)  # in CLI comments are importants
     # Error if the parameter is not present
     __assert_pname_in_obj(parameter_name, o, parameters_file_path)
     
@@ -176,7 +177,7 @@ def yml_parameter_remove(parameters_file_path, parameter_name, str_value, file_d
         file_display = parameters_file_path
     
     # First get the value
-    o = yamler.get_object_from_parameter_file(parameters_file_path)
+    o = yamler.get_object_from_parameter_file(parameters_file_path, with_comments=True)  # in CLI comments are importants
     # Error if the parameter is not present
     __assert_pname_in_obj(parameter_name, o, parameters_file_path)
     
@@ -203,10 +204,11 @@ def yml_parameter_remove(parameters_file_path, parameter_name, str_value, file_d
     cprint(' %s ' % CHARACTERS.arrow_left, end='')
     cprint(str_value, color='green')
 
+
 def get_terminal_size():
     try:
         height, width = struct.unpack('hhhh', ioctl(sys.stdout, TIOCGWINSZ, '\000' * 8))[0:2]
-    except IOError, exp:
+    except IOError as exp:
         raise Exception('Cannot get the terminal size (%s error)' % exp)
     return height, width
 
@@ -428,8 +430,25 @@ _donut_0 = u'''
 '''.replace('XX', r'%2d').replace('Y', r'%%')
 
 
+class HBarPrinter(object):
+    @staticmethod
+    def get_hbar(pct_0_1, width):
+        fill_len = int(width * pct_0_1)
+        bar = ''
+        for i in range(fill_len):
+            pct = 1 - 1.0 * i / width
+            char_color = colorpalette.get_color_from_percent_between_0_1(pct, color_pack=COLOR_PACK_CITRON_TO_VIOLET)
+            bar += lolcat.get_line(CHARACTERS.bar_fill, char_color, spread=None)
+        
+        pad_size = width - fill_len
+        padding_bar = CHARACTERS.bar_unfill * pad_size
+        
+        return sprintf(bar, end='') + sprintf(padding_bar, color='grey', end='')
+
+
 class DonutPrinter(object):
-    def get_donut(self, value):
+    @staticmethod
+    def get_donut(value):
         
         try:
             if 0 < value < 1:  # round 0

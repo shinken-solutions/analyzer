@@ -1,22 +1,23 @@
 #!/usr/bin/env python
 import json
 import os
+import codecs
+import traceback
 
-from opsbro.yamlmgr import yamler
-from opsbro.log import LoggerFactory
-from opsbro.httpdaemon import http_export, response
+from .yamlmgr import yamler
+from .log import LoggerFactory
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('packs')
 
+# Pack directory levels, but beware: the order IS important
+PACKS_LEVELS = ('core', 'global', 'zone', 'local')
+REVERSE_PACKS_LEVELS = tuple(reversed(PACKS_LEVELS))
 
 class PackManager(object):
     def __init__(self):
-        self.packs = {'global': {}, 'zone': {}, 'local': {}}
+        self.packs = {'core': {}, 'global': {}, 'zone': {}, 'local': {}}
         
-        # We got an object, we can fill the http daemon part
-        self.export_http()
-    
     
     def load_package(self, package, file_path, level):
         if level not in self.packs:
@@ -51,12 +52,12 @@ class PackManager(object):
             package_pth = os.path.join(pname, 'package.yml')
             if os.path.exists(package_pth):
                 try:
-                    with open(package_pth, 'r') as f:
+                    with codecs.open(package_pth, 'r', encoding='utf8') as f:
                         package_buf = f.read()
                         package = yamler.loads(package_buf)
                         self.load_package(package, package_pth, level)
-                except Exception, exp:  # todo: more precise catch? I think so
-                    logger.error('Cannot load package %s: %s' % (package_pth, exp))
+                except Exception as exp:  # todo: more precise catch? I think so
+                    logger.error('Cannot load package %s: %s' % (package_pth, traceback.format_exc()))
     
     
     # We want to have directories that we need to load, but there is a rule:
@@ -64,7 +65,7 @@ class PackManager(object):
     def give_pack_directories_to_load(self):
         to_load_idx = set()  # used to know if we already see suck a pack
         to_load = {}
-        for level in ('local', 'zone', 'global'):
+        for level in REVERSE_PACKS_LEVELS:
             for pname in self.packs[level]:
                 if pname in to_load_idx:
                     logger.debug('Skipping pack %s/%s to load because it was already present in a more priority level' % (level, pname))
@@ -82,7 +83,7 @@ class PackManager(object):
     
     
     def get_pack_all_topics(self, pname):
-        for level in ('local', 'zone', 'global'):
+        for level in REVERSE_PACKS_LEVELS:
             pack = self.packs[level].get(pname, None)
             if not pack:
                 continue
@@ -102,6 +103,8 @@ class PackManager(object):
     # main method to export http interface. Must be in a method that got
     # a self entry
     def export_http(self):
+        from .httpdaemon import http_export, response
+        
         @http_export('/packs/')
         @http_export('/packs')
         def get_packs():

@@ -6,11 +6,18 @@ import json
 import base64
 import inspect
 import types
-import itertools
+import sys
 
-from opsbro.collectormanager import collectormgr
-from opsbro.log import LoggerFactory
-from opsbro.httpdaemon import http_export, response, request
+try:  # Python2
+    from itertools import izip as zip
+except ImportError:  # python3 = zip is a buildin
+    pass
+
+PY3 = sys.version_info >= (3,)
+
+from .collectormanager import collectormgr
+from .log import LoggerFactory
+from .util import string_decode
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('evaluater')
@@ -42,9 +49,11 @@ operators = {
 }
 
 functions = {
+    'list': list,
 }
 
 functions_to_groups = {
+    'list': 'basic',
 }
 
 
@@ -80,7 +89,7 @@ for f in (abs, min, max, sum, sorted, len, set):
     # NOTE: find why, but we need to call the not decorated function... cool...
     _export_evaluater_function(f, function_group='basic')
 
-names = {'True': True, 'False': False}
+names = {'True': True, 'False': False, 'None': None}
 
 
 class Evaluater(object):
@@ -91,6 +100,13 @@ class Evaluater(object):
     
     def load(self, cfg_data):
         self.cfg_data = cfg_data
+    
+    
+    # We want a simple string at the end, but try to be a bit smart when doing it
+    def __change_to_string(self, o):
+        if isinstance(o, list) or isinstance(o, set):
+            return ','.join([str(e) for e in o])
+        return str(o)
     
     
     def compile(self, expr, check=None, to_string=False, variables={}):
@@ -139,7 +155,7 @@ class Evaluater(object):
         for (p, v) in changes:
             f = repr
             if to_string:
-                f = str
+                f = self.__change_to_string
             expr = expr.replace('%s' % p, f(v))
         
         return expr
@@ -153,7 +169,7 @@ class Evaluater(object):
         tree = ast.parse(expr, mode='eval').body
         try:
             r = self.eval_(tree)
-        except Exception, exp:
+        except Exception as exp:
             logger.debug('EVAL: fail to eval expr: %s : %s' % (expr, exp))
             raise
         try:
@@ -176,14 +192,25 @@ class Evaluater(object):
         elif isinstance(node, ast.Dict):  # <dict>
             _keys = [self.eval_(e) for e in node.keys]
             _values = [self.eval_(e) for e in node.values]
-            _dict = dict(itertools.izip(_keys, _values))  # zip it into a new dict
+            _dict = dict(zip(_keys, _values))  # zip it into a new dict
             return _dict
         elif isinstance(node, ast.BinOp):  # <left> <operator> <right>
             return operators[type(node.op)](self.eval_(node.left), self.eval_(node.right))
         elif isinstance(node, _ast.BoolOp):  # <elt1> OP <elt2>   TOD: manage more than 2 params
             if len(node.values) != 2:
                 raise Exception('Cannot manage and/or operators woth more than 2 parts currently.')
-            return operators[type(node.op)](self.eval_(node.values[0]), self.eval_(node.values[1]))
+            # Special case: _ast.And   if the first element is False, then we should NOT eval the right part
+            # and directly returns False
+            left_part_eval = self.eval_(node.values[0])
+            if not left_part_eval and isinstance(node.op, _ast.And):
+                return False
+            # Special case: _ast.Or   if the first element is True, then we should NOT eval the right part
+            # and directly returns True
+            left_part_eval = self.eval_(node.values[0])
+            if left_part_eval and isinstance(node.op, _ast.Or):
+                return True
+            # else, give the whole result
+            return operators[type(node.op)](left_part_eval, self.eval_(node.values[1]))
         elif isinstance(node, ast.Compare):  # <left> <operator> <right>
             left = self.eval_(node.left)
             right = self.eval_(node.comparators[0])
@@ -198,6 +225,11 @@ class Evaluater(object):
         elif isinstance(node, ast.Name):  # name? try to look at it
             key = node.id
             v = names.get(key, None)
+            return v
+        # None, True, False are nameconstants in python3, but names in 2
+        elif PY3 and isinstance(node, ast.NameConstant):
+            key = node.value
+            v = names.get(str(key), None)  # note: valus is alrady the final value, must lookup it to assert only what we want
             return v
         elif isinstance(node, ast.Subscript):  # {}['key'] access
             # NOTE: the 'key' is node.slice.value.s
@@ -247,7 +279,7 @@ class Evaluater(object):
     # Try to find the params for a macro pack parameters
     def _found_params(self, m, check):
         # only import it now because if not will do an import loop
-        from opsbro.configurationmanager import configmgr
+        from .configurationmanager import configmgr
         parts = [m]
         # if we got a |, we got a default value somewhere
         if '|' in m:
@@ -294,7 +326,7 @@ class Evaluater(object):
     # main method to export http interface. Must be in a method that got
     # a self entry
     def export_http(self):
-        
+        from .httpdaemon import http_export, response, request
         @http_export('/agent/evaluator/list')
         def get_exports():
             response.content_type = 'application/json'
@@ -336,6 +368,7 @@ class Evaluater(object):
             response.content_type = 'application/json'
             expr64 = request.POST.get('expr')
             expr = base64.b64decode(expr64)
+            expr = string_decode(expr)  # from bytes to string
             v = evaluater.eval_expr(expr)
             return json.dumps(v)
 

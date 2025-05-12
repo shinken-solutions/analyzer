@@ -1,0 +1,19 @@
+name: kvm
+topics:
+    - automatic detection
+types:
+    - pack
+version: "1.0"
+homepage: ""
+author: Shinken Solutions
+description: Look at KVM hypervisor information
+contributors:
+    - Jean Gabès
+repository: ""
+keywords:
+    - pack
+    - hypervisor
+    - kvm
+dependencies:
+    core: ">=1.0"
+license: ""

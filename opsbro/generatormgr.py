@@ -1,21 +1,24 @@
 import time
 import os
+import json
 
-from opsbro.log import LoggerFactory
-from opsbro.stop import stopper
-from opsbro.httpdaemon import http_export, response
-from opsbro.evaluater import evaluater
-from opsbro.collectormanager import collectormgr
-from opsbro.gossip import gossiper
-from opsbro.monitoring import monitoringmgr
-from opsbro.generator import Generator
+from .log import LoggerFactory
+from .stop import stopper
+from .generator import Generator, GENERATOR_STATES
+from .basemanager import BaseManager
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('generator')
 
 
-class GeneratorMgr(object):
+class GeneratorMgr(BaseManager):
+    history_directory_suffix = 'generator'
+    
+    
     def __init__(self):
+        super(GeneratorMgr, self).__init__()
+        
+        self.logger = logger
         self.generators = {}
         # Did we run at least once
         self.did_run = False
@@ -30,8 +33,8 @@ class GeneratorMgr(object):
         generator['name'] = generator['id'] = gname
         if 'notes' not in generator:
             generator['notes'] = ''
-        if 'if_group' not in generator:
-            generator['if_group'] = generator['name']
+        
+        generator['generate_if'] = generator.get('generate_if', 'False')
         
         for prop in ['path', 'template']:
             if prop not in generator:
@@ -40,7 +43,7 @@ class GeneratorMgr(object):
         # Template must be from configuration path
         gen_base_dir = os.path.dirname(fr)
         
-        generator['template'] = os.path.normpath(os.path.join(gen_base_dir, generator['template']))
+        generator['template'] = os.path.normpath(os.path.join(gen_base_dir, 'templates', generator['template']))
         # and path must be a abs path
         generator['path'] = os.path.abspath(generator['path'])
         
@@ -57,31 +60,67 @@ class GeneratorMgr(object):
             return
         
         # Add it into the generators list
-        self.generators[generator['id']] = generator
+        self.generators[generator['id']] = Generator(generator)
     
     
     # Main thread for launching generators
     def do_generator_thread(self):
+        # Before run, be sure we have a history directory ready
+        self.prepare_history_directory()
+        
         logger.log('GENERATOR thread launched')
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             logger.debug('Looking for %d generators' % len(self.generators))
-            for (gname, gen) in self.generators.iteritems():
-                logger.debug('LOOK AT GENERATOR', gen, 'to be apply on', gen['if_group'], 'with our groups', gossiper.groups)
-                if_group = gen['if_group']
+            for (gname, g) in self.generators.items():
+                logger.debug('LOOK AT GENERATOR', g, 'to be apply if', g.generate_if)
                 # Maybe this generator is not for us...
-                if if_group != '*' and if_group not in gossiper.groups:
+                if not g.must_be_launched():
                     continue
-                logger.debug('Generator %s will runs' % gname)
-                g = Generator(gen)
                 logger.debug('Generator %s will generate' % str(g.__dict__))
                 g.generate()
                 logger.debug('Generator %s is generated' % str(g.__dict__))
                 should_launch = g.write_if_need()
                 if should_launch:
                     g.launch_command()
+                history_entry = g.get_history_entry()
+                if history_entry:
+                    self.add_history_entry(history_entry)
+            
             # Ok we did run at least once :)
             self.did_run = True
+            
+            # each seconds we try to look if there are history info to save
+            self.write_history_entry()
+            
             time.sleep(1)
+    
+    
+    def get_infos(self):
+        r = {}
+        for state in GENERATOR_STATES:
+            r[state] = 0
+        for g in self.generators.values():
+            r[g.get_state()] += 1
+        return r
+    
+    
+    def export_http(self):
+        from .httpdaemon import http_export, response
+        
+        @http_export('/generators/history', method='GET')
+        def get_generator_history_checks():
+            response.content_type = 'application/json'
+            r = self.get_history()
+            return json.dumps(r)
+        
+        
+        @http_export('/generators/state', method='GET')
+        def get_generator_state():
+            response.content_type = 'application/json'
+            nc = {}
+            for (c_id, c) in self.generators.items():
+                nc[c_id] = c.get_json_dump()
+            return json.dumps(nc)
 
 
 generatormgr = GeneratorMgr()

@@ -4,7 +4,7 @@ import platform
 import socket
 
 from opsbro.collector import Collector
-from opsbro.util import get_public_address
+from opsbro.hostingdrivermanager import get_hostingdrivermgr
 from opsbro.systempacketmanager import get_systepacketmgr
 
 try:
@@ -31,8 +31,8 @@ class System(Collector):
         res['os']['platform'] = sys.platform
         res['architecture'] = platform.uname()[-1]
         # Lazy load multiprocessing
-        import multiprocessing
-        res['cpu_count'] = multiprocessing.cpu_count()
+        from multiprocessing import cpu_count
+        res['cpu_count'] = cpu_count()
         res['cpu_model_name'] = ''
         res['cpu_mhz'] = 0
         
@@ -107,15 +107,14 @@ class System(Collector):
             except OSError:  # some background daemon can have problem on ancien os
                 if pwd is not None:
                     res['user'] = pwd.getpwuid(os.geteuid()).pw_name
-            res['uid'] = os.getuid()
-            res['gid'] = os.getgid()
+            if hasattr(os, 'getuid'):  # windows python 3 do not have it
+                res['uid'] = os.getuid()
+                res['gid'] = os.getgid()
         
-        res['publicip'] = ''
-        try:
-            res['publicip'] = socket.gethostbyname(socket.gethostname())
-        except socket.gaierror:
-            pass
-        if not res['publicip'] or res['publicip'].startswith('127.'):
-            res['publicip'] = get_public_address()
+        # Get public & local address, and directly from the hosting driver as it already does the job
+        hostingdrvmgr = get_hostingdrivermgr()
+        res['public_ip'] = hostingdrvmgr.get_public_address()
+        res['local_ip'] = hostingdrvmgr.get_local_address()
+        
         logger.debug('getsystem: completed, returning')
         return res

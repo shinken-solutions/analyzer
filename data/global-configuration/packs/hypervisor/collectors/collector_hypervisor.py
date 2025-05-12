@@ -3,7 +3,10 @@ import string
 import platform
 import os
 import ctypes
+import sys
 from ctypes import c_uint32, c_int, c_size_t, c_void_p, POINTER, CFUNCTYPE
+
+PY3 = sys.version_info >= (3,)
 
 from opsbro.collector import Collector
 
@@ -146,14 +149,18 @@ class Hypervisor(Collector):
         res = {'hypervisor': ''}
         try:
             cpu = CPUID()
-        except Exception, exp:
-            self.logger.warning('Cannot get cpuid/hypervisor information: %s' % exp)
+        except SystemError:  # not a x86
+            self.set_not_eligible('Cpuid/hypervisor is only available for x86 cpus')
+            return res
+        except Exception as exp:
+            self.set_error('Cannot get cpuid/hypervisor information: %s' % exp)
             return res
         
         hypervisor = struct.pack('IIII', *cpu(HYPERVISOR_INFO_LEAF)).decode('ascii', 'ignore')
         
         # clean the hypervisor string because we can (will) have non printable chars
-        res['hypervisor'] = ''.join(x for x in hypervisor if x in string.letters)
+        letters = string.ascii_letters if PY3 else string.letters
+        res['hypervisor'] = ''.join(x for x in hypervisor if x in letters)
         
         return res
 

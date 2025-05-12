@@ -1,3 +1,4 @@
+from __future__ import print_function
 import sys
 import traceback
 
@@ -18,9 +19,12 @@ class OpenPorts(Collector):
         
         try:
             _cmd = 'netstat -tuln'
-            netstat = self.execute_shell(_cmd)
-            if not netstat:
-                logger.error('get_open_ports: exception in launching command')
+            try:
+                netstat = self.execute_shell(_cmd)
+            except Exception as exp:
+                self.set_error('get_open_ports: exception in launching command: %s' % exp)
+                return False
+            if netstat is False:
                 return False
             
             for line in netstat.splitlines():
@@ -58,10 +62,11 @@ class OpenPorts(Collector):
                 elif open_port['proto'].startswith('udp'):
                     open_port_details['udp'].append(open_port)
                 else:
-                    print "Unknown protocol??"
+                    self.set_error("Unknown protocol?? %s" % open_port['proto'])
+                    return False
         
         except Exception:
-            logger.error('get_open_ports: exception = %s', traceback.format_exc())
+            self.set_error('get_open_ports: exception = %s' % traceback.format_exc())
             return False
         
         open_ports = list(open_ports)

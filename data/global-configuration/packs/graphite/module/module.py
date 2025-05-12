@@ -1,9 +1,13 @@
+from __future__ import print_function
 import time
 import socket
 import hashlib
-import json
 import re
-import cPickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+    
 import base64
 
 # DO NOT FORGEET:
@@ -20,8 +24,9 @@ from opsbro.util import to_best_int_float
 from opsbro.gossip import gossiper
 from opsbro.httpclient import get_http_exceptions, httper
 from opsbro.kv import kvmgr
-from opsbro.library import libstore
 from opsbro.parameters import BoolParameter, IntParameter
+from opsbro.log import cprint
+from opsbro.jsonmgr import jsoner
 
 
 class GraphiteModule(ListenerModule):
@@ -44,7 +49,7 @@ class GraphiteModule(ListenerModule):
         self.enabled = False
         self.graphite_port = 2003
         self.addr = '0.0.0.0'
-
+        
         self.graphite_tcp_sock = None
         self.graphite_udp_sock = None
     
@@ -80,7 +85,9 @@ class GraphiteModule(ListenerModule):
     
     
     def get_info(self):
-        return {'graphite_configuration': self.get_config(), 'graphite_info': None}
+        state = 'STARTED' if self.enabled else 'DISABLED'
+        log = ''
+        return {'configuration': self.get_config(), 'state': state, 'log': log}
     
     
     def launch(self):
@@ -91,7 +98,7 @@ class GraphiteModule(ListenerModule):
     
     # Thread for listening to the graphite port in UDP (2003)
     def launch_graphite_udp_listener(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             if not self.enabled:
                 time.sleep(1)
                 continue
@@ -107,7 +114,7 @@ class GraphiteModule(ListenerModule):
     # Same but for the TCP connections
     # TODO: use a real daemon part for this, this is not ok for fast receive
     def launch_graphite_tcp_listener(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             if not self.enabled:
                 time.sleep(1)
                 continue
@@ -121,7 +128,7 @@ class GraphiteModule(ListenerModule):
             while True:
                 try:
                     ldata = conn.recv(1024)
-                except Exception, exp:
+                except Exception as exp:
                     break
                 if not ldata:
                     break
@@ -143,7 +150,7 @@ class GraphiteModule(ListenerModule):
     # Main graphite reaper thread, that will get data from both tcp and udp flow
     # and dispatch it to the others daemons if need
     def graphite_reaper(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             graphite_queue = self.graphite_queue
             self.graphite_queue = []
             if len(graphite_queue) > 0:
@@ -186,7 +193,7 @@ class GraphiteModule(ListenerModule):
                 l.append(line)
                 forwards[ts_node_manager] = l
         
-        for (uuid, lst) in forwards.iteritems():
+        for (uuid, lst) in forwards.items():
             node = gossiper.get(uuid)
             # maybe the node disapear? bail out, we are not lucky
             if node is None:
@@ -221,19 +228,19 @@ class GraphiteModule(ListenerModule):
     
     # Export end points to get/list TimeSeries
     def export_http(self):
-    
+        
         @http_export('/metrics/find/')
         @http_export('/metrics/find')
         def get_graphite_metrics_find():
             response.content_type = 'application/json'
             key = request.GET.get('query', '*')
-            print "LIST GET TS FOR KEY", key
+            cprint("LIST GET TS FOR KEY", key)
             
             recursive = False
             if key.endswith('.*'):
                 recursive = True
                 key = key[:-2]
-                print "LIST RECURSVIE FOR", key
+                cprint("LIST RECURSVIE FOR", key)
             
             # Maybe ask all, if so recursive is On
             if key == '*':
@@ -245,27 +252,27 @@ class GraphiteModule(ListenerModule):
             l = len(key)
             added = {}
             for k in keys:
-                print "LIST KEY", k
+                cprint("LIST KEY", k)
                 title = k[l:]
                 # maybe we got a key that do not belong to us
                 # like srv-linux10 when we ask for linux1
                 # so if we don't got a . here, it's an invalid
                 # dir
-                print "LIST TITLE", title
+                cprint("LIST TITLE", title)
                 if key and not title.startswith('.'):
-                    print "LIST SKIPPING KEY", key
+                    cprint("LIST SKIPPING KEY", key)
                     continue
                 
                 # Ok here got sons, but maybe we are not asking for recursive ones, if so exit with
                 # just the key as valid tree
                 if not recursive:
-                    print "NO RECURSIVE AND EARLY EXIT for KEY", key
-                    return json.dumps(
+                    cprint("NO RECURSIVE AND EARLY EXIT for KEY", key)
+                    return jsoner.dumps(
                         [{"leaf": 0, "context": {}, 'text': key, 'id': key, "expandable": 1, "allowChildren": 1}])
                 
                 if title.startswith('.'):
                     title = title[1:]
-                print "LIST TITLE CLEAN", title
+                cprint("LIST TITLE CLEAN", title)
                 # if there is a . in it, it's a dir we need to have
                 dname = title.split('.', 1)[0]
                 # If the dnmae was not added, do it
@@ -273,16 +280,16 @@ class GraphiteModule(ListenerModule):
                     added[dname] = True
                     r.append({"leaf"         : 0, "context": {}, 'text': dname, 'id': k[:l] + dname, 'expandable': 1,
                               'allowChildren': 1})
-                    print "LIST ADD DIR", dname, k[:l] + dname
+                    cprint("LIST ADD DIR", dname, k[:l] + dname)
                 
-                print "LIST DNAME KEY", dname, key, title.count('.')
+                cprint("LIST DNAME KEY", dname, key, title.count('.'))
                 if title.count('.') == 0:
                     # not a directory, add it directly but only if the
                     # key asked was our directory
                     r.append({"leaf": 1, "context": {}, 'text': title, 'id': k, "expandable": 0, "allowChildren": 0})
-                    print "LIST ADD FILE", title
-            print "LIST FINALLY RETURN", r
-            return json.dumps(r)
+                    cprint("LIST ADD FILE", title)
+            cprint("LIST FINALLY RETURN", r)
+            return jsoner.dumps(r)
         
         
         # really manage the render call, with real return, call by a get and
@@ -372,7 +379,7 @@ class GraphiteModule(ListenerModule):
                         if hour_e and hour_e['hour'] == t:
                             self.logger.debug('HTTP TS RENDER match memory HOUR, take this value instead')
                             raw_values = hour_e['values'][:]  # copy instead of cherrypick, because it can move/append
-                            for i in xrange(60):
+                            for i in range(60):
                                 # Get teh value and the time
                                 e = raw_values[i]
                                 tt = t + 60 * i
@@ -383,15 +390,15 @@ class GraphiteModule(ListenerModule):
                             ukey = '%s::h%d' % (target, t)
                             raw64 = kvmgr.get_key(ukey)
                             if raw64 is None:
-                                for i in xrange(60):
+                                for i in range(60):
                                     # Get the value and the time
                                     tt = t + 60 * i
                                     r.append((None, tt))
                             else:
                                 raw = base64.b64decode(raw64)
-                                v = cPickle.loads(raw)
+                                v = pickle.loads(raw)
                                 raw_values = v['values']
-                                for i in xrange(60):
+                                for i in range(60):
                                     # Get teh value and the time
                                     e = raw_values[i]
                                     tt = t + 60 * i
@@ -406,16 +413,16 @@ class GraphiteModule(ListenerModule):
                         self.logger.debug('TS: (get /render) relaying to %s: %s' % (n['name'], uri))
                         r = httper.get(uri)
                         self.logger.debug('TS: get /render founded (%d)' % len(r))
-                        v = json.loads(r)
+                        v = jsoner.loads(r)
                         self.logger.debug("TS /render relay GOT RETURN", v, "AND RES", res)
                         res.extend(v)
                         self.logger.debug("TS /render res is now", res)
-                    except get_http_exceptions(), exp:
+                    except get_http_exceptions() as exp:
                         self.logger.debug('TS: /render relay error asking to %s: %s' % (n['name'], str(exp)))
                         continue
             
             self.logger.debug('TS RENDER FINALLY RETURN', res)
-            return json.dumps(res)
+            return jsoner.dumps(res)
         
         
         @http_export('/render')

@@ -1,0 +1,15 @@
+FROM       naparuba/debian-9
+MAINTAINER Jean Gabes <naparuba@gmail.com>
+
+ADD        test/docker-helper/  /
+
+RUN        /apt_get_install jq
+
+
+ADD        . /root/opsbro-oss
+
+
+WORKDIR    /root/opsbro-oss
+
+
+ENTRYPOINT     test/test_module_shinken_enterprise.sh

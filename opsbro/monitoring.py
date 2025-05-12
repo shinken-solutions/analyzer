@@ -1,32 +1,43 @@
 import re
 import os
-import json
 import tempfile
 import shutil
 import copy
 import time
 import random
-import subprocess
 import socket
 import hashlib
 
-from opsbro.log import LoggerFactory
-from opsbro.gossip import gossiper
-from opsbro.kv import kvmgr
-from opsbro.httpdaemon import http_export, response, request, abort
-from opsbro.stop import stopper
-from opsbro.threadmgr import threader
-from opsbro.perfdata import PerfDatas
-from opsbro.evaluater import evaluater
-from opsbro.ts import tsmgr
-from opsbro.handlermgr import handlermgr
+from .log import LoggerFactory
+from .gossip import gossiper
+from .kv import kvmgr
+from .stop import stopper
+from .threadmgr import threader
+from .perfdata import PerfDatas
+from .evaluater import evaluater
+from .ts import tsmgr
+from .handlermgr import handlermgr
+from .topic import topiker, TOPIC_MONITORING
+from .basemanager import BaseManager
+from .jsonmgr import jsoner
+from .util import exec_command
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('monitoring')
 
+CHECK_STATES = ['ok', 'warning', 'critical', 'unknown', 'pending']
+STATE_ID_COLORS = {0: 'green', 2: 'red', 1: 'yellow', 3: 'cyan'}
+STATE_COLORS = {'ok': 'green', 'warning': 'yellow', 'critical': 'red', 'unknown': 'grey', 'pending': 'grey'}
 
-class MonitoringManager(object):
+
+class MonitoringManager(BaseManager):
+    history_directory_suffix = 'monitoring'
+    
+    
     def __init__(self):
+        super(MonitoringManager, self).__init__()
+        self.logger = logger
+        
         self.checks = {}
         self.services = {}
         
@@ -51,7 +62,7 @@ class MonitoringManager(object):
         defaults_ = {'interval'       : '10s', 'script': '', 'ok_output': '', 'critical_if': '',
                      'critical_output': '', 'warning_if': '', 'warning_output': '', 'last_check': 0,
                      'notes'          : ''}
-        for (k, v) in defaults_.iteritems():
+        for (k, v) in defaults_.items():
             if k not in check:
                 check[k] = v
         if service:
@@ -70,7 +81,11 @@ class MonitoringManager(object):
         check['modification_time'] = mod_time
         check['state'] = 'pending'
         check['state_id'] = 3
+        check['old_state'] = 'pending'
+        check['old_state_id'] = 3
         check['output'] = ''
+        check['variables'] = check.get('variables', {})
+        check['computed_variables'] = {}
         self.checks[check['id']] = check
     
     
@@ -107,7 +122,7 @@ class MonitoringManager(object):
         self.link_checks()
         
         # Now we can save the received entry, but first clean unless props
-        to_remove = ['from', 'last_check', 'modification_time', 'state', 'output', 'state_id', 'id']
+        to_remove = ['from', 'last_check', 'modification_time', 'state', 'output', 'state_id', 'id', 'old_state', 'old_state_id']
         for prop in to_remove:
             try:
                 del check[prop]
@@ -116,7 +131,7 @@ class MonitoringManager(object):
         
         o = {'check': check}
         logger.debug('HTTP check saving the object %s into the file %s' % (o, p))
-        buf = json.dumps(o, sort_keys=True, indent=4)
+        buf = jsoner.dumps(o, sort_keys=True, indent=4)
         tempdir = tempfile.mkdtemp()
         f = open(os.path.join(tempdir, 'temp.json'), 'w')
         f.write(buf)
@@ -163,11 +178,11 @@ class MonitoringManager(object):
         
         logger.log('CHECK loading check retention file %s' % check_retention)
         with open(check_retention, 'r') as f:
-            loaded = json.loads(f.read())
-            for (cid, c) in loaded.iteritems():
+            loaded = jsoner.loads(f.read())
+            for (cid, c) in loaded.items():
                 if cid in self.checks:
                     check = self.checks[cid]
-                    to_load = ['last_check', 'output', 'state', 'state_id']
+                    to_load = ['last_check', 'output', 'state', 'state_id', 'old_state', 'old_state_id']
                     for prop in to_load:
                         check[prop] = c[prop]
     
@@ -178,8 +193,8 @@ class MonitoringManager(object):
         
         logger.log('Service loading service retention file %s' % service_retention)
         with open(service_retention, 'r') as f:
-            loaded = json.loads(f.read())
-            for (cid, c) in loaded.iteritems():
+            loaded = jsoner.loads(f.read())
+            for (cid, c) in loaded.items():
                 if cid in self.services:
                     service = self.services[cid]
                     to_load = ['state_id', 'incarnation']
@@ -206,7 +221,7 @@ class MonitoringManager(object):
         self.link_services()
         
         # We maybe got a new service, so export this data to every one in the gossip way :)
-        gossiper.increase_incarnation_and_broadcast('alive')
+        gossiper.increase_incarnation_and_broadcast()
         
         # Now we can save the received entry, but first clean unless props
         to_remove = ['from', 'last_check', 'modification_time', 'state', 'output', 'state_id', 'id']
@@ -218,7 +233,7 @@ class MonitoringManager(object):
         
         o = {'service': service}
         logger.debug('HTTP service saving the object %s into the file %s' % (o, p))
-        buf = json.dumps(o, sort_keys=True, indent=4)
+        buf = jsoner.dumps(o, sort_keys=True, indent=4)
         tempdir = tempfile.mkdtemp()
         f = open(os.path.join(tempdir, 'temp.json'), 'w')
         f.write(buf)
@@ -240,7 +255,7 @@ class MonitoringManager(object):
             del self.services[sname]
         self.link_services()
         # We maybe got a less service, so export this data to every one in the gossip way :)
-        gossiper.increase_incarnation_and_broadcast('alive')
+        gossiper.increase_incarnation_and_broadcast()
     
     
     # Look at our services dict and link the one we are if_group
@@ -248,11 +263,12 @@ class MonitoringManager(object):
     def link_services(self):
         logger.debug('LINK my services and my node entry')
         node = gossiper.get(gossiper.uuid)
-        groups = node['groups']
-        for (sname, service) in self.services.iteritems():
-            if_group = service.get('if_group', '')
-            if if_group and if_group in groups:
-                node['services'][sname] = service
+        with gossiper.nodes_lock:
+            groups = node['groups']
+            for (sname, service) in self.services.items():
+                if_group = service.get('if_group', '')
+                if if_group and if_group in groups:
+                    node['services'][sname] = service
     
     
     # For checks we will only populate our active_checks list
@@ -260,59 +276,36 @@ class MonitoringManager(object):
     def link_checks(self):
         logger.debug('LOOKING FOR our checks that match our groups')
         node = gossiper.get(gossiper.uuid)
-        groups = node['groups']
-        active_checks = []
-        for (cname, check) in self.checks.iteritems():
-            if_group = check.get('if_group', '*')
-            if if_group == '*' or if_group in groups:
-                active_checks.append(cname)
-        self.active_checks = active_checks
-        # Also update our checks list in KV space
-        self.update_checks_kv()
-        # and in our own node object
-        checks_entry = {}
-        for (cname, check) in self.checks.iteritems():
-            if cname not in active_checks:
-                continue
-            checks_entry[cname] = {'state_id': check['state_id']}  # by default state are unknown
-        node['checks'] = checks_entry
+        with gossiper.nodes_lock:
+            groups = node['groups']
+            active_checks = []
+            for (cname, check) in self.checks.items():
+                if_group = check.get('if_group', '*')
+                if if_group == '*' or if_group in groups:
+                    active_checks.append(cname)
+            self.active_checks = active_checks
+            # Also update our checks list in KV space
+            self.update_checks_kv()
+            # and in our own node object
+            checks_entry = {}
+            for (cname, check) in self.checks.items():
+                if cname not in active_checks:
+                    continue
+                checks_entry[cname] = {'state_id': check['state_id']}  # by default state are unknown
+            node['checks'] = checks_entry
     
     
-    # Main thread for launching checks (each with its own thread)
-    def do_check_thread(self):
-        logger.log('CHECK thread launched')
-        cur_launchs = {}
-        while not stopper.interrupted:
-            now = int(time.time())
-            for (cid, check) in self.checks.iteritems():
-                # maybe this chck is not a activated one for us, if so, bail out
-                if cid not in self.active_checks:
-                    continue
-                # maybe a check is already running
-                if cid in cur_launchs:
-                    continue
-                # else look at the time
-                last_check = check['last_check']
-                interval = int(check['interval'].split('s')[0])  # todo manage like it should
-                # in the conf reading phase
-                interval = random.randint(int(0.9 * interval), int(1.1 * interval))
-                
-                if last_check < now - interval:
-                    # randomize a bit the checks
-                    script = check['script']
-                    logger.debug('CHECK: launching check %s:%s' % (cid, script))
-                    t = threader.create_and_launch(self.launch_check, name='check-%s' % cid, args=(check,), part='monitoring')
-                    cur_launchs[cid] = t
-            
-            to_del = []
-            for (cid, t) in cur_launchs.iteritems():
-                if not t.is_alive():
-                    t.join()
-                    to_del.append(cid)
-            for cid in to_del:
-                del cur_launchs[cid]
-            
-            time.sleep(1)
+    def __get_variables(self, check):
+        variables = check['variables']
+        
+        # We need to evaluate our variables if there are some
+        computed_variables = {}
+        for (k, expr) in variables.items():
+            try:
+                computed_variables[k] = evaluater.eval_expr(expr)
+            except Exception as exp:
+                raise Exception('the variable %s expr %s did fail to evaluate: %s' % (k, expr, exp))
+        return computed_variables
     
     
     # Try to find the params for a macro in the foloowing objets, in that order:
@@ -382,20 +375,42 @@ class MonitoringManager(object):
         output = 'Check not configured'
         err = ''
         if critical_if or warning_if:
+            b = False
+            try:
+                computed_variables = self.__get_variables(check)
+            except Exception as exp:
+                output = "ERROR: the variable expression fail: %s" % exp
+                b = True
+                rc = 2
+                computed_variables = {}
             if critical_if:
-                b = evaluater.eval_expr(critical_if, check=check)
+                try:
+                    b = evaluater.eval_expr(critical_if, check=check, variables=computed_variables)
+                except Exception as exp:
+                    output = "ERROR: the critical_if expression fail: %s : %s" % (critical_if, exp)
+                    b = False
+                    rc = 2
                 if b:
-                    output = evaluater.eval_expr(check.get('critical_output', ''))
+                    output = evaluater.eval_expr(check.get('critical_output', ''), variables=computed_variables)
                     rc = 2
             if not b and warning_if:
-                b = evaluater.eval_expr(warning_if, check=check)
+                try:
+                    b = evaluater.eval_expr(warning_if, check=check, variables=computed_variables)
+                except Exception as exp:
+                    output = "ERROR: the warning_if expression fail: %s : %s" % (warning_if, exp)
+                    b = False
+                    rc = 2
                 if b:
-                    output = evaluater.eval_expr(check.get('warning_output', ''))
+                    output = evaluater.eval_expr(check.get('warning_output', ''), variables=computed_variables)
                     rc = 1
             # if unset, we are in OK
             if rc == 3:
                 rc = 0
-                output = evaluater.eval_expr(check.get('ok_output', ''))
+                try:
+                    output = evaluater.eval_expr(check.get('ok_output', ''), variables=computed_variables)
+                except Exception as exp:
+                    output = "ERROR: the ok_output expression fail: %s : %s" % (check.get('ok_output', ''), exp)
+                    rc = 2
         else:
             script = check['script']
             logger.debug("CHECK start: MACRO launching %s" % script)
@@ -408,36 +423,50 @@ class MonitoringManager(object):
                 script = script.replace(to_repl, change_to)
             logger.debug("MACRO finally computed", script)
             
-            p = subprocess.Popen(script, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, preexec_fn=os.setsid)
-            output, err = p.communicate()
-            rc = p.returncode
+            rc, output, err = exec_command(script)
             # not found error like (127) should be catch as unknown check
             if rc > 3:
                 rc = 3
         logger.debug("CHECK RETURN %s : %s %s %s" % (check['id'], rc, output, err))
         did_change = (check['state_id'] != rc)
-        check['state'] = {0: 'ok', 1: 'warning', 2: 'critical', 3: 'unknown'}.get(rc, 'unknown')
-        if 0 <= rc <= 3:
-            check['state_id'] = rc
-        else:
-            check['state_id'] = 3
+        if did_change:
+            # Then save the old state values
+            check['old_state'] = check['state']
+            check['old_state_id'] = check['state_id']
+            
+            check['state'] = {0: 'ok', 1: 'warning', 2: 'critical', 3: 'unknown'}.get(rc, 'unknown')
+            if 0 <= rc <= 3:
+                check['state_id'] = rc
+            else:
+                check['state_id'] = 3
         
         check['output'] = output + err
         check['last_check'] = int(time.time())
-        self.analyse_check(check, did_change)
+        self.__analyse_check(check, did_change)
         
         # Launch the handlers, some need the data if the element did change or not
         handlermgr.launch_check_handlers(check, did_change)
     
     
+    def __get_history_entry_from_check(self, check):
+        r = {}
+        fields = ['name', 'pack_name', 'pack_level', 'output', 'last_check', 'display_name', 'state', 'state_id', 'old_state', 'old_state_id']
+        for field in fields:
+            r[field] = check[field]
+        return r
+    
+    
     # get a check return and look it it did change a service state. Also save
     # the result in the __health KV
-    def analyse_check(self, check, did_change):
+    def __analyse_check(self, check, did_change):
         logger.debug('CHECK we got a check return, deal with it for %s' % check)
         
         # if did change, update the node check entry about it
         if did_change:
             gossiper.update_check_state_id(check['name'], check['state_id'])
+            # and save a history entry about it
+            history_entry = self.__get_history_entry_from_check(check)
+            self.add_history_entry(history_entry)
         
         # by default warn others nodes if the check did change
         warn_about_our_change = did_change
@@ -459,7 +488,7 @@ class MonitoringManager(object):
         
         # If our check or service did change, warn thers nodes about it
         if warn_about_our_change:
-            gossiper.increase_incarnation_and_broadcast('alive')
+            gossiper.increase_incarnation_and_broadcast()
         
         # We finally put the result in the KV database
         self.put_check(check)
@@ -467,7 +496,7 @@ class MonitoringManager(object):
     
     # Save the check as a jsono object into the __health/ KV part
     def put_check(self, check):
-        value = json.dumps(check)
+        value = jsoner.dumps(check)
         key = '__health/%s/%s' % (gossiper.uuid, check['name'])
         logger.debug('CHECK SAVING %s:%s(len=%d)' % (key, value, len(value)))
         kvmgr.put_key(key, value, allow_udp=True)
@@ -505,14 +534,61 @@ class MonitoringManager(object):
     def do_update_checks_kv(self):
         logger.info("CHECK UPDATING KV checks")
         names = []
-        for (cid, check) in self.checks.iteritems():
+        for (cid, check) in self.checks.items():
             # Only the checks that we are really managing
             if cid in self.active_checks:
                 names.append(check['name'])
                 self.put_check(check)
-        all_checks = json.dumps(names)
+        all_checks = jsoner.dumps(names)
         key = '__health/%s' % gossiper.uuid
         kvmgr.put_key(key, all_checks)
+    
+    
+    # Main thread for launching checks (each with its own thread)
+    def do_check_thread(self):
+        # Before run, be sure we have a history directory ready
+        self.prepare_history_directory()
+        
+        logger.log('CHECK thread launched')
+        cur_launchs = {}
+        while not stopper.is_stop():
+            # If we are not allowed to do monitoring stuff, do nothing
+            if not topiker.is_topic_enabled(TOPIC_MONITORING):
+                time.sleep(1)
+                continue
+            now = int(time.time())
+            for (cid, check) in self.checks.items():
+                # maybe this chck is not a activated one for us, if so, bail out
+                if cid not in self.active_checks:
+                    continue
+                # maybe a check is already running
+                if cid in cur_launchs:
+                    continue
+                # else look at the time
+                last_check = check['last_check']
+                interval = int(check['interval'].split('s')[0])  # todo manage like it should
+                # in the conf reading phase
+                interval = random.randint(int(0.9 * interval), int(1.1 * interval))
+                
+                if last_check < now - interval:
+                    # randomize a bit the checks
+                    script = check['script']
+                    logger.debug('CHECK: launching check %s:%s' % (cid, script))
+                    t = threader.create_and_launch(self.launch_check, name='check-%s' % cid, args=(check,), part='monitoring')
+                    cur_launchs[cid] = t
+            
+            to_del = []
+            for (cid, t) in cur_launchs.items():
+                if not t.is_alive():
+                    t.join()
+                    to_del.append(cid)
+            for cid in to_del:
+                del cur_launchs[cid]
+            
+            # each seconds we try to look if there are history info to save
+            self.write_history_entry()
+            
+            time.sleep(1)
     
     
     # Will delete all checks into the kv and update new values, but in a thread
@@ -541,7 +617,7 @@ class MonitoringManager(object):
                 l.append(line)
                 forwards[ts_node_manager] = l
         
-        for (uuid, lst) in forwards.iteritems():
+        for (uuid, lst) in forwards.items():
             node = gossiper.get(uuid)
             # maybe the node disapear? bail out, we are not lucky
             if node is None:
@@ -565,7 +641,19 @@ class MonitoringManager(object):
             sock.close()
     
     
+    def get_infos(self):
+        counts = {}
+        for state in CHECK_STATES:
+            counts[state] = 0
+        checks = self.checks.values()
+        for check in checks:
+            counts[check['state']] += 1
+        return counts
+    
+    
     def export_http(self):
+        from .httpdaemon import http_export, response, request, abort
+        
         @http_export('/monitoring/state/:nuuid')
         @http_export('/monitoring/state')
         def get_state(nuuid=''):
@@ -574,31 +662,36 @@ class MonitoringManager(object):
             # by default it's us
             # maybe its us, maybe not
             if nuuid == '' or nuuid == gossiper.uuid:
-                for (cid, check) in self.checks.iteritems():
+                for (cid, check) in self.checks.items():
                     # maybe this chck is not a activated one for us, if so, bail out
                     if cid not in self.active_checks:
                         continue
                     r['checks'][cid] = check
-                r['services'] = gossiper.get(gossiper.uuid)['services']
+                # NOTE: we do not want services object from gossiper to be access in //
+                # after we return it
+                with gossiper.nodes_lock:
+                    r['services'] = copy.deepcopy(gossiper.get(gossiper.uuid)['services'])
                 return r
             else:  # find the elements
                 node = gossiper.get(nuuid)
                 if node is None:
                     return abort(404, 'This node is not found')
-                # Services are easy, we already got them
-                r['services'] = node['services']
+                # NOTE: we do not want services object from gossiper to be access in //
+                # after we return it
+                with gossiper.nodes_lock:
+                    r['services'] = copy.deepcopy(node['services'])
                 # checks are harder, we must find them in the kv nodes
                 v = kvmgr.get_key('__health/%s' % node['uuid'])
                 if v is None or v == '':
                     logger.error('Cannot access to the checks list for', nuuid)
                     return r
                 
-                lst = json.loads(v)
+                lst = jsoner.loads(v)
                 for cid in lst:
                     v = kvmgr.get_key('__health/%s/%s' % (node['uuid'], cid))
                     if v is None:  # missing check entry? not a real problem
                         continue
-                    check = json.loads(v)
+                    check = jsoner.loads(v)
                     r['checks'][cid] = check
                 return r
         
@@ -629,7 +722,7 @@ class MonitoringManager(object):
         def interface_PUT_agent_check(cname):
             value = request.body.getvalue()
             try:
-                check = json.loads(value)
+                check = jsoner.loads(value)
             except ValueError:  # bad json
                 return abort(400, 'Bad json entry')
             self.save_check(cname, check)
@@ -654,7 +747,7 @@ class MonitoringManager(object):
         def interface_PUT_agent_service(sname):
             value = request.body.getvalue()
             try:
-                service = json.loads(value)
+                service = jsoner.loads(value)
             except ValueError:  # bad json
                 return abort(400, 'Bad json entry')
             self.save_service(sname, service)
@@ -682,8 +775,8 @@ class MonitoringManager(object):
                 service['failing-members'] = []
                 service['failing'] = 0
             with gossiper.nodes_lock:
-                for (uuid, node) in gossiper.nodes.iteritems():
-                    for (sname, service) in node['services'].iteritems():
+                for (uuid, node) in gossiper.nodes.items():
+                    for (sname, service) in node['services'].items():
                         if sname not in services:
                             continue
                         services[sname]['members'].append(node['name'])
@@ -713,7 +806,7 @@ class MonitoringManager(object):
             service['failing'] = 0
             sname = service.get('name')
             with gossiper.nodes_lock:
-                for (uuid, node) in gossiper.nodes.iteritems():
+                for (uuid, node) in gossiper.nodes.items():
                     if sname not in node['services']:
                         continue
                     service['members'].append(node['name'])
@@ -725,6 +818,13 @@ class MonitoringManager(object):
                         service['failing-members'].append(node['name'])
             
             return service
+        
+        
+        @http_export('/monitoring/history/checks', method='GET')
+        def get_monitoring_history_checks():
+            response.content_type = 'application/json'
+            r = self.get_history()
+            return jsoner.dumps(r)
 
 
 monitoringmgr = MonitoringManager()

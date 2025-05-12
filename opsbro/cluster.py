@@ -6,7 +6,6 @@ import threading
 import time
 import hashlib
 import signal
-import cStringIO
 import tempfile
 import tarfile
 import base64
@@ -18,57 +17,54 @@ import copy
 # sysctl -w net.core.rmem_max=26214400
 
 
-
-
-from opsbro.log import LoggerFactory
-from opsbro.log import logger as raw_logger
-from opsbro.util import copy_dir, get_public_address, get_server_const_uuid, guess_server_const_uuid
-from opsbro.threadmgr import threader
-from opsbro.now import NOW
-from opsbro.httpclient import get_http_exceptions, httper
+from .log import LoggerFactory, DEFAULT_LOG_PART
+from .log import core_logger as raw_logger
+from .util import get_server_const_uuid, guess_server_const_uuid, get_cpu_consumption, get_memory_consumption, unicode_to_bytes
+from .threadmgr import threader
+from .now import NOW
+from .httpclient import get_http_exceptions, httper
 
 # now singleton objects
-from opsbro.gossip import gossiper
-from opsbro.configurationmanager import configmgr
-from opsbro.kv import kvmgr
-from opsbro.broadcast import broadcaster
-from opsbro.httpdaemon import httpdaemon, http_export, response, request, abort, gserver
-from opsbro.pubsub import pubsub
-from opsbro.dockermanager import dockermgr
-from opsbro.library import libstore
-from opsbro.collectormanager import collectormgr
-from opsbro.info import VERSION
-from opsbro.stop import stopper
-from opsbro.evaluater import evaluater
-from opsbro.detectormgr import detecter
-from opsbro.generatormgr import generatormgr
-from opsbro.ts import tsmgr
-from opsbro.jsonmgr import jsoner
-from opsbro.modulemanager import modulemanager
-from opsbro.executer import executer
-from opsbro.monitoring import monitoringmgr
-from opsbro.installermanager import installormgr
-from opsbro.compliancemgr import compliancemgr
-from opsbro.defaultpaths import DEFAULT_LIBEXEC_DIR, DEFAULT_LOCK_PATH, DEFAULT_DATA_DIR, DEFAULT_LOG_DIR, DEFAULT_CFG_DIR, DEFAULT_SOCK_PATH
+from .gossip import gossiper
+from .raft import get_rafter
+from .configurationmanager import configmgr
+from .kv import kvmgr
+from .dockermanager import dockermgr
+from .library import libstore
+from .collectormanager import collectormgr
+from .info import VERSION, PROJECT_NAME
+from .stop import stopper
+from .evaluater import evaluater
+from .detectormgr import detecter
+from .generatormgr import generatormgr
+from .ts import tsmgr
+from .jsonmgr import jsoner
+from .modulemanager import modulemanager
+from .executer import executer
+from .monitoring import monitoringmgr
+from .compliancemgr import compliancemgr
+from .defaultpaths import DEFAULT_LIBEXEC_DIR, DEFAULT_LOCK_PATH, DEFAULT_DATA_DIR, DEFAULT_LOG_DIR, DEFAULT_CFG_DIR, DEFAULT_SOCK_PATH
+from .hostingdrivermanager import get_hostingdrivermgr
+from .topic import topiker, TOPIC_SERVICE_DISCOVERY, TOPIC_AUTOMATIC_DECTECTION, TOPIC_MONITORING, TOPIC_METROLOGY, TOPIC_CONFIGURATION_AUTOMATION, TOPIC_SYSTEM_COMPLIANCE
+from .packer import packer
+from .agentstates import AGENT_STATES
+from .udplistener import get_udp_listener
+from .zonemanager import zonemgr
 
 # Global logger for this part
-logger = LoggerFactory.create_logger('agent')
+logger = LoggerFactory.create_logger(DEFAULT_LOG_PART)
 logger_gossip = LoggerFactory.create_logger('gossip')
-
-AGENT_STATE_INITIALIZING = 'initializing'
-AGENT_STATE_OK = 'ok'
-AGENT_STATE_STOPPED = 'stopped'
 
 
 class Cluster(object):
-    def __init__(self, port=6768, name='', bootstrap=False, seeds='', groups='', cfg_dir='', libexec_dir=''):
+    def __init__(self, cfg_dir='', libexec_dir=''):
         self.set_exit_handler()
         
         # We need to keep a trace about in what state we are globally
         # * initializing= not all threads did loop once
         # * ok= all threads did loop
         # * stopping= stop in progress
-        self.agent_state = AGENT_STATE_INITIALIZING
+        self._set_agent_state(AGENT_STATES.AGENT_STATE_INITIALIZING)
         
         # Launch the now-update thread
         NOW.launch()
@@ -83,29 +79,36 @@ class Cluster(object):
         
         # Some default value that can be erased by the
         # main configuration file
-        # By default no encryption
-        self.encryption_key = ''
-        # Same for public/priv for the master fucking key
-        self.master_key_priv = ''  # Paths
-        self.master_key_pub = ''
-        self.mfkey_priv = None  # real key objects
-        self.mfkey_pub = None
-        
         # By default, we are not a proxy, and with default port
         self.is_proxy = False
-        self.port = port
-        self.name = name
+        self.port = 6768
+        self.name = ''
         self.display_name = ''
+        self.process_name = PROJECT_NAME  # by default the process name will be opsbro but can be override by the conf
         self.hostname = socket.gethostname()
         if not self.name:
             self.name = '%s' % self.hostname
-        self.groups = [s.strip() for s in groups.split(',') if s.strip()]
+        self.groups = []
         
-        self.bootstrap = bootstrap
-        self.seeds = [s.strip() for s in seeds.split(',')]
+        self.bootstrap = False
+        self.seeds = []
         self.zone = ''
         
-        self.addr = get_public_address()
+        # Topics
+        self.service_discovery_topic_enabled = True
+        self.automatic_detection_topic_enabled = True
+        self.monitoring_topic_enabled = True
+        self.metrology_topic_enabled = True
+        self.configuration_automation_topic_enabled = True
+        self.system_compliance_topic_enabled = True
+        
+        # The public IP can be a bit complex, as maybe the local host do not even have it in it's
+        # network interface: EC2 and scaleway are example of public ip -> NAT -> private one and
+        # the linux do not even know it
+        hosttingdrvmgr = get_hostingdrivermgr()
+        self.addr = hosttingdrvmgr.get_local_address()
+        self.public_addr = hosttingdrvmgr.get_public_address()  # can be different for cloud based env
+        
         self.listening_addr = '0.0.0.0'
         
         self.data_dir = os.path.abspath(os.path.join(DEFAULT_DATA_DIR))  # '/var/lib/opsbro/'
@@ -119,7 +122,7 @@ class Cluster(object):
         # now we read them, set it in our object
         parameters_from_local_configuration = configmgr.get_parameters_for_cluster_from_configuration()
         
-        for (k, v) in parameters_from_local_configuration.iteritems():
+        for (k, v) in parameters_from_local_configuration.items():
             logger.debug('Setting parameter from local configuration: %s => %s' % (k, v))
             setattr(self, k, v)
         
@@ -134,62 +137,12 @@ class Cluster(object):
         raw_logger.load(self.log_dir, self.name)
         raw_logger.export_http()
         
-        # Look if our encryption key is valid or not
-        encrypter = libstore.get_encrypter()
-        if self.encryption_key:
-            AES = encrypter.get_AES()
-            if AES is None:
-                logger.error('You set an encryption key but cannot import python-crypto module, please install it. Exiting.')
-                sys.exit(2)
-            try:
-                self.encryption_key = base64.b64decode(self.encryption_key)
-            except ValueError:
-                logger.error('The encryption key is invalid, not in base64 format')
-                sys.exit(2)
-        # and load the encryption key in the global encrypter object
-        encrypter.load(self.encryption_key)
-        
-        # Same for master fucking key PRIVATE
-        if self.master_key_priv:
-            if not os.path.isabs(self.master_key_priv):
-                self.master_key_priv = os.path.join(self.cfg_dir, self.master_key_priv)
-            if not os.path.exists(self.master_key_priv):
-                logger.error('Cannot find the master key private file at %s' % self.master_key_priv)
-            else:
-                RSA = encrypter.get_RSA()
-                if RSA is None:
-                    logger.error('You set a master private key but but cannot import python-rsa module, please install it. Exiting.')
-                    sys.exit(2)
-                
-                with open(self.master_key_priv, 'r') as f:
-                    buf = f.read()
-                try:
-                    self.mfkey_priv = RSA.PrivateKey.load_pkcs1(buf)
-                except Exception, exp:
-                    logger.error('Invalid master private key at %s. (%s) Exiting.' % (self.master_key_priv, exp))
-                    sys.exit(2)
-                logger.info('Master private key file %s is loaded' % self.master_key_priv)
-        
-        # Same for master fucking key PUBLIC
-        if self.master_key_pub:
-            if not os.path.isabs(self.master_key_pub):
-                self.master_key_pub = os.path.join(self.cfg_dir, self.master_key_pub)
-            if not os.path.exists(self.master_key_pub):
-                logger.error('Cannot find the master key public file at %s' % self.master_key_pub)
-            else:
-                RSA = encrypter.get_RSA()
-                if RSA is None:
-                    logger.error('You set a master public key but but cannot import python-crypto module, please install it. Exiting.')
-                    sys.exit(2)
-                # let's try to open the key so :)
-                with open(self.master_key_pub, 'r') as f:
-                    buf = f.read()
-                try:
-                    self.mfkey_pub = RSA.PublicKey.load_pkcs1(buf)
-                except Exception, exp:
-                    logger.error('Invalid master public key at %s. (%s) Exiting.' % (self.master_key_pub, exp))
-                    sys.exit(2)
-                logger.info('Master public key file %s is loaded' % self.master_key_pub)
+        topiker.set_topic_state(TOPIC_SERVICE_DISCOVERY, self.service_discovery_topic_enabled)
+        topiker.set_topic_state(TOPIC_AUTOMATIC_DECTECTION, self.automatic_detection_topic_enabled)
+        topiker.set_topic_state(TOPIC_MONITORING, self.monitoring_topic_enabled)
+        topiker.set_topic_state(TOPIC_METROLOGY, self.metrology_topic_enabled)
+        topiker.set_topic_state(TOPIC_CONFIGURATION_AUTOMATION, self.configuration_automation_topic_enabled)
+        topiker.set_topic_state(TOPIC_SYSTEM_COMPLIANCE, self.system_compliance_topic_enabled)
         
         # Open the retention data about our previous runs
         # but some are specific to this agent uuid
@@ -217,7 +170,7 @@ class Cluster(object):
             if self.hostname == last_hostname and os.path.exists(self.server_key_file):
                 with open(self.server_key_file, 'r') as f:
                     self.uuid = f.read()
-                logger.log("KEY: %s loaded from previous key file %s" % (self.uuid, self.server_key_file))
+                logger.info("KEY: %s loaded from previous key file %s" % (self.uuid, self.server_key_file))
             else:
                 # Ok no way to get from past, so try to guess the more stable possible, and if not ok, give me random stuff
                 self.uuid = guess_server_const_uuid()
@@ -225,7 +178,7 @@ class Cluster(object):
         # now save the key
         with open(self.server_key_file, 'w') as f:
             f.write(self.uuid)
-        logger.log("KEY: %s saved to the key file %s" % (self.uuid, self.server_key_file))
+        logger.info("KEY: %s saved to the key file %s" % (self.uuid, self.server_key_file))
         
         # we can save the current hostname
         with open(self.hostname_file, 'w') as f:
@@ -245,7 +198,7 @@ class Cluster(object):
         # up to date info)
         if os.path.exists(self.nodes_file):
             with open(self.nodes_file, 'r') as f:
-                nodes = json.loads(f.read())
+                nodes = jsoner.loads(f.read())
                 # If we were in nodes, remove it, we will refresh it
                 if self.uuid in nodes:
                     del nodes[self.uuid]
@@ -257,7 +210,7 @@ class Cluster(object):
         # Load some files, like the old incarnation file
         if os.path.exists(self.incarnation_file):
             with open(self.incarnation_file, 'r') as f:
-                self.incarnation = json.loads(f.read())
+                self.incarnation = jsoner.loads(f.read())
                 self.incarnation += 1
         else:
             self.incarnation = 0
@@ -278,7 +231,7 @@ class Cluster(object):
         # we keep the data about the last time we were launch, to detect crash and such things
         if os.path.exists(self.last_alive_file):
             with open(self.last_alive_file, 'r') as f:
-                self.last_alive = json.loads(f.read())
+                self.last_alive = jsoner.loads(f.read())
         else:
             self.last_alive = int(time.time())
         
@@ -286,6 +239,10 @@ class Cluster(object):
         if os.path.exists(self.zone_file):
             with open(self.zone_file, 'r') as f:
                 self.zone = f.read().strip()
+        
+        if not zonemgr.have_zone(self.zone):
+            logger.error('The zone %s is unknown. Please change your configuration.' % self.zone)
+            sys.exit(2)
         
         # Try to clean libexec and configuration directories
         self.libexec_dir = libexec_dir
@@ -296,16 +253,8 @@ class Cluster(object):
         if self.configuration_dir:
             self.configuration_dir = os.path.abspath(self.configuration_dir)
         
-        # Our main events dict, should not be too old or we will delete them
-        self.events_lock = threading.RLock()
-        self.events = {}
-        self.max_event_age = 30
-        
-        # We will receive a list of path to update for libexec, and we will manage them
-        # in athread so the upd thread is not blocking
-        self.libexec_to_update = []
-        self.configuration_to_update = []
-        threader.create_and_launch(self.do_update_libexec_cfg_thread, name='Checks directory (libexec) updates', essential=True, part='agent')
+        # Threader should export it's http objects
+        threader.export_http()
         
         # by default do not launch timeserie listeners
         
@@ -322,19 +271,25 @@ class Cluster(object):
         tsmgr.tsb.load(self.data_dir)
         tsmgr.tsb.export_http()
         
-        # Load key into the executor
-        executer.load(self.mfkey_pub, self.mfkey_priv)
+        # Executore interface
         executer.export_http()
         
         # the evaluater need us to grok into our cfg_data and such things
         evaluater.load(self.cfg_data)
         evaluater.export_http()
         
+        # Raft need http too
+        rafter = get_rafter()  # create rafter here, with gossip layer (default)
+        rafter.export_http()
+        
+        # packer need http export too (lasy export)
+        packer.export_http()
+        
         # Load docker thing if possible
         dockermgr.export_http()
         
         # Our main object for gossip managment
-        gossiper.init(nodes, nodes_lock, self.addr, self.port, self.name, self.display_name, self.incarnation, self.uuid, self.groups, self.seeds, self.bootstrap, self.zone, self.is_proxy)
+        gossiper.init(nodes, nodes_lock, self.public_addr, self.port, self.name, self.display_name, self.incarnation, self.uuid, self.groups, self.seeds, self.bootstrap, self.zone, self.is_proxy)
         
         # About detecting groups and such things
         detecter.export_http()
@@ -349,8 +304,8 @@ class Cluster(object):
         # Export checks/services http interface
         monitoringmgr.export_http()
         
-        # Also run installor part, as it need other part to be runs
-        installormgr.export_http()
+        # Export generators http interface
+        generatormgr.export_http()
         
         # And the configuration
         configmgr.export_http()
@@ -358,8 +313,23 @@ class Cluster(object):
         # Compliance too
         compliancemgr.export_http()
         
-        # get the message in a pub-sub way
-        pubsub.sub('manage-message', self.manage_message_pub)
+        # Be sure that the udp listener object is created
+        udp_listener = get_udp_listener()
+        
+        # Let the process title be the valid one (can be set by the configuration)
+        libstore.get_processtitler().set_name(self.process_name)
+    
+    
+    # We update the global agent state so other known about it, and also the user via the process name
+    def _set_agent_state(self, state):
+        self.agent_state = state
+        processtitler = libstore.get_processtitler()
+        display_states = {
+            AGENT_STATES.AGENT_STATE_INITIALIZING: 'initializing',
+            AGENT_STATES.AGENT_STATE_OK          : 'running',
+            AGENT_STATES.AGENT_STATE_STOPPED     : 'stopping',
+        }
+        processtitler.set_key('agent', display_states.get(state, 'unknown'))
     
     
     # Load raw results of collectors, and give them to the
@@ -368,35 +338,25 @@ class Cluster(object):
         if not os.path.exists(self.collector_retention):
             return
         
-        logger.log('Collectors loading collector retention file %s' % self.collector_retention)
+        logger.info('Collectors loading collector retention file %s' % self.collector_retention)
         with open(self.collector_retention, 'r') as f:
-            loaded = json.loads(f.read())
+            loaded = jsoner.loads(f.read())
             collectormgr.load_retention(loaded)
-        logger.log('Collectors loaded retention file %s' % self.collector_retention)
+        logger.info('Collectors loaded retention file %s' % self.collector_retention)
     
     
     # What to do when we receive a signal from the system
     def manage_signal(self, sig, frame):
-        logger.log("I'm process %d and I received signal %s" % (os.getpid(), str(sig)))
+        logger.info("I'm process %d and I received signal %s" % (os.getpid(), str(sig)))
         if sig == signal.SIGUSR1:  # if USR1, ask a memory dump
-            logger.log('MANAGE USR1')
+            logger.info('MANAGE USR1')
         elif sig == signal.SIGUSR2:  # if USR2, ask objects dump
-            logger.log('MANAGE USR2')
+            logger.info('MANAGE USR2')
         else:  # Ok, really ask us to die :)
-            self.set_interrupted()
-    
-    
-    # Callback for objects that want us to stop in a clean way
-    def set_interrupted(self):
-        # and the global object too
-        stopper.interrupted = True
+            stopper.do_stop('Stop from signal %s received' % sig)
     
     
     def set_exit_handler(self):
-        # First register the self.interrupted in the pubsub call
-        # interrupt
-        pubsub.sub('interrupt', self.set_interrupted)
-        
         func = self.manage_signal
         if os.name == "nt":
             try:
@@ -411,31 +371,33 @@ class Cluster(object):
                 signal.signal(sig, func)
     
     
-    def launch_check_thread(self):
+    @staticmethod
+    def launch_check_thread():
         threader.create_and_launch(monitoringmgr.do_check_thread, name='Checks executions', essential=True, part='monitoring')
     
     
-    def launch_collector_thread(self):
+    @staticmethod
+    def launch_collector_thread():
         threader.create_and_launch(collectormgr.do_collector_thread, name='Collector scheduling', essential=True, part='collector')
     
     
-    def launch_generator_thread(self):
+    @staticmethod
+    def launch_generator_thread():
         threader.create_and_launch(generatormgr.do_generator_thread, name='Generator scheduling', essential=True, part='generator')
     
     
-    def launch_detector_thread(self):
+    @staticmethod
+    def launch_detector_thread():
         threader.create_and_launch(detecter.do_detector_thread, name='Detector scheduling', essential=True, part='detector')
     
     
-    def launch_compliance_thread(self):
+    @staticmethod
+    def launch_compliance_thread():
         threader.create_and_launch(compliancemgr.do_compliance_thread, name='System compliance', essential=True, part='compliance')
     
     
-    def launch_installor_thread(self):
-        threader.create_and_launch(installormgr.do_installer_thread, name='Installor scheduling', essential=True, part='installor')
-    
-    
-    def launch_replication_backlog_thread(self):
+    @staticmethod
+    def launch_replication_backlog_thread():
         threader.create_and_launch(kvmgr.do_replication_backlog_thread, name='Replication backlog', essential=True, part='key-value')
     
     
@@ -443,91 +405,32 @@ class Cluster(object):
         threader.create_and_launch(self.do_replication_first_sync_thread, name='First replication synchronization', essential=True, part='key-value')
     
     
-    def launch_gossip_listener(self):
-        threader.create_and_launch(self.launch_udp_listener, name='UDP listener', essential=True, part='gossip')
-    
-    
     def launch_http_listeners(self):
         threader.create_and_launch(self.launch_tcp_listener, name='Http backend', essential=True, part='agent')
     
     
-    def launch_modules_threads(self):
+    def launch_pinghome_thread(self):
+        threader.create_and_launch(self.launch_pinghome, name='Ping Home', essential=False, part='agent')
+    
+    
+    @staticmethod
+    def launch_modules_threads():
         # Launch modules threads
         modulemanager.launch()
     
     
-    def launch_udp_listener(self):
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)  # Allow Broadcast (useful for node discovery)
-        logger.info("OPENING UDP", self.addr)
-        self.udp_sock.bind((self.listening_addr, self.port))
-        logger.log("UDP port open", self.port)
-        while not stopper.interrupted:
-            try:
-                data, addr = self.udp_sock.recvfrom(65535)  # buffer size is 1024 bytes
-            except socket.timeout:
-                continue  # nothing in few seconds? just loop again :)
-            
-            # No data? bail out :)
-            if len(data) == 0:
-                logger_gossip.debug("UDP: received void message from ", addr)
-                continue
-            
-            # Look if we use encryption
-            encrypter = libstore.get_encrypter()
-            data = encrypter.decrypt(data)
-            # Maybe the decryption failed?
-            if data == '':
-                logger_gossip.debug("UDP: received message with bad encryption key from ", addr)
-                continue
-            logger_gossip.debug("UDP: received message:", data, 'from', addr)
-            # Ok now we should have a json to parse :)
-            try:
-                raw = json.loads(data)
-            except ValueError:  # garbage
-                logger_gossip.debug("UDP: received message that is not valid json:", data, 'from', addr)
-                continue
-            
-            if isinstance(raw, list):
-                messages = raw
-            else:
-                messages = [raw]
-            for m in messages:
-                if not isinstance(m, dict):
-                    continue
-                t = m.get('type', None)
-                if t is None:
-                    continue
-                if t == 'ping':
-                    gossiper.manage_ping_message(m, addr)
-                elif t == 'ping-relay':
-                    gossiper.manage_ping_relay_message(m, addr)
-                elif t == 'detect-ping':
-                    gossiper.manage_detect_ping_message(m, addr)
-                elif t == '/kv/put':
-                    k = m['k']
-                    v = m['v']
-                    fw = m.get('fw', False)
-                    # For perf data we allow the udp send
-                    kvmgr.put_key(k, v, allow_udp=True, fw=fw)
-                elif t == '/ts/new':
-                    key = m.get('key', '')
-                    # Skip this message for classic nodes
-                    if key == '':
-                        continue
-                    # if TS do not have it, it will propagate it
-                    tsmgr.set_name_if_unset(key)
-                # Someone is asking us a challenge, ok do it
-                elif t == '/exec/challenge/ask':
-                    executer.manage_exec_challenge_ask_message(m, addr)
-                elif t == '/exec/challenge/return':
-                    executer.manage_exec_challenge_return_message(m, addr)
-                else:
-                    self.manage_message(m)
+    def launch_pinghome(self):
+        is_travis = os.environ.get('TRAVIS', 'false') == 'true'
+        headers = {'User-Agent': 'OpsBro / %s (travis:%s)' % (VERSION, is_travis)}
+        try:
+            httper.get('http://shinken.io/pingbro', headers=headers)
+        except:  # not a problem
+            pass
     
     
     # TODO: SPLIT into modules :)
     def launch_tcp_listener(self):
+        from .httpdaemon import httpdaemon, http_export, response, request, abort, gserver
         
         @http_export('/agent/state')
         def get_agent_state():
@@ -538,24 +441,46 @@ class Cluster(object):
         @http_export('/agent/info')
         def get_info():
             response.content_type = 'application/json'
-            r = {'agent_state': self.agent_state,
-                 'logs'       : raw_logger.get_errors(), 'pid': os.getpid(), 'name': self.name, 'display_name': self.display_name,
-                 'port'       : self.port, 'addr': self.addr, 'socket': self.socket_path, 'zone': gossiper.zone,
-                 'uuid'       : gossiper.uuid,
-                 'threads'    : threader.get_info(),
-                 'version'    : VERSION, 'groups': gossiper.groups,
-                 'docker'     : dockermgr.get_info(),
-                 'collectors' : collectormgr.get_info(),
-                 'kv'         : kvmgr.get_info(),
+            
+            from opsbro.systempacketmanager import get_systepacketmgr
+            
+            systepacketmgr = get_systepacketmgr()
+            system_distro, system_distroversion, _ = systepacketmgr.get_distro()
+            
+            r = {'agent_state'         : self.agent_state,
+                 'logs'                : raw_logger.get_errors(),
+                 'pid'                 : os.getpid(),
+                 'name'                : self.name,
+                 'display_name'        : self.display_name,
+                 'port'                : self.port, 'local_addr': self.addr, 'public_addr': self.public_addr,
+                 'socket'              : self.socket_path,
+                 'zone'                : gossiper.zone,
+                 'is_zone_protected'   : libstore.get_encrypter().is_zone_have_key(gossiper.zone),
+                 'uuid'                : gossiper.uuid,
+                 'threads'             : threader.get_info(),
+                 'version'             : VERSION, 'groups': gossiper.groups,
+                 'docker'              : dockermgr.get_info(),
+                 'collectors'          : collectormgr.get_info(),
+                 'kv'                  : kvmgr.get_info(),
+                 'hosting_driver'      : get_hostingdrivermgr().get_driver_name(), 'hosting_drivers_state': get_hostingdrivermgr().get_drivers_state(),
+                 'topics'              : topiker.get_topic_states(),
+                 'monitoring'          : monitoringmgr.get_infos(),
+                 'compliance'          : compliancemgr.get_infos(),
+                 'cpu_consumption'     : get_cpu_consumption(),
+                 'memory_consumption'  : get_memory_consumption(),
+                 'generators'          : generatormgr.get_infos(),
+                 'is_managed_system'   : systepacketmgr.is_managed_system(),
+                 'system_distro'       : system_distro,
+                 'system_distroversion': system_distroversion,
                  }
             
             # Update the infos with modules ones
             mod_infos = modulemanager.get_infos()
-            r.update(mod_infos)
+            r['modules'] = mod_infos
             
             r['httpservers'] = {}
             # Look at both http servers
-            for (k, server) in gserver.iteritems():
+            for (k, server) in gserver.items():
                 if server is None:
                     r['httpservers'][k] = None
                     continue
@@ -615,7 +540,7 @@ class Cluster(object):
                 kvmgr.put_key(key, buf64)
                 
                 payload = {'type': 'libexec', 'path': path, 'hash': _hash}
-                self.stack_event_broadcast(payload)
+                gossiper.stack_event_broadcast(payload)
         
         
         @http_export('/agent/propagate/configuration', method='GET')
@@ -656,7 +581,7 @@ class Cluster(object):
                 kvmgr.put_key(key, buf64)
                 
                 payload = {'type': 'configuration', 'path': path, 'hash': _hash}
-                self.stack_event_broadcast(payload)
+                gossiper.stack_event_broadcast(payload)
             
             ok_files = [fname[len(os.path.abspath(self.configuration_dir)) + 1:] for fname in all_files]
             logger.debug("propagate configuration All files", ok_files)
@@ -665,22 +590,22 @@ class Cluster(object):
             zj64 = base64.b64encode(zj)
             kvmgr.put_key('__configuration', zj64)
             payload = {'type': 'configuration-cleanup'}
-            self.stack_event_broadcast(payload)
+            gossiper.stack_event_broadcast(payload)
         
         
         @http_export('/configuration/update', method='PUT')
         def update_configuration():
             value = request.body.getvalue()
-            logger.debug("HTTP: configuration update put %s" % (value))
+            logger.debug("HTTP: configuration update put %s" % value)
             try:
-                update = json.loads(value)
+                update = jsoner.loads(value)
             except ValueError:  # bad json...
                 return abort(400, 'Bad json data')
             local_file = os.path.join(self.configuration_dir, 'local.json')
             j = {}
             with open(local_file, 'r') as f:
                 buf = f.read()
-                j = json.loads(buf)
+                j = jsoner.loads(buf)
             j.update(update)
             # Now save it
             with open(local_file, 'w') as f:
@@ -700,7 +625,7 @@ class Cluster(object):
             
             with open(local_file, 'r') as f:
                 buf = f.read()
-                j = json.loads(buf)
+                j = jsoner.loads(buf)
             return j
         
         
@@ -709,44 +634,51 @@ class Cluster(object):
             response.content_type = 'application/json'
             
             nzone = request.body.getvalue()
-            logger.debug("HTTP: /agent/zone put %s" % (nzone))
-            gossiper.change_zone(nzone)
+            logger.debug("HTTP: /agent/zone put %s" % nzone)
+            try:
+                gossiper.change_zone(nzone)
+            except ValueError:  # no such zone
+                return json.dumps({'success': False, 'text': 'The zone %s does not exist' % nzone})
             with open(self.zone_file, 'w') as f:
                 f.write(nzone)
-            return json.dumps(True)
+            return json.dumps({'success': True, 'text': 'The node change to zone %s' % nzone})
         
         
         @http_export('/stop', protected=True)
         def do_stop():
-            pubsub.pub('interrupt')
+            stopper.do_stop('stop call from the CLI/API')
             return 'OK'
         
         
         @http_export('/debug/memory', protected=True)
         def do_memory_dump():
             response.content_type = 'application/json'
-            from meliae import scanner
+            try:
+                from meliae import scanner
+            except ImportError:
+                logger.error('Cannot run a memory dump, missing python-meliae')
+                return json.dumps(None)
             p = '/tmp/memory-%s' % self.name
             scanner.dump_all_objects(p)
             return json.dumps(p)
         
         
-        self.external_http_thread = threader.create_and_launch(httpdaemon.run, name='External HTTP', args=(self.listening_addr, self.port, ''), essential=True, part='agent')
+        threader.create_and_launch(httpdaemon.run, name='External HTTP', args=(self.listening_addr, self.port, ''), essential=True, part='agent')
         # Create the internal http thread
         # on unix, use UNIXsocket
         if os.name != 'nt':
-            self.internal_http_thread = threader.create_and_launch(httpdaemon.run, name='Internal HTTP', args=('', 0, self.socket_path,), essential=True, part='agent')
+            threader.create_and_launch(httpdaemon.run, name='Internal HTTP', args=('', 0, self.socket_path,), essential=True, part='agent')
         else:  # ok windows, I look at you, really
-            self.internal_http_thread = threader.create_and_launch(httpdaemon.run, name='Internal HTTP', args=('127.0.0.1', 6770, '',), essential=True, part='agent')
+            threader.create_and_launch(httpdaemon.run, name='Internal HTTP', args=('127.0.0.1', 6770, '',), essential=True, part='agent')
     
     
     # The first sync thread will ask to our replicats for their lately changed value
     # and we will get the key/value from it
     def do_replication_first_sync_thread(self):
         if 'kv' not in gossiper.groups:
-            logger.log('SYNC no need, I am not a KV node')
+            logger.info('SYNC no need, I am not a KV node')
             return
-        logger.log('SYNC thread launched')
+        logger.info('SYNC thread launched')
         # We will look until we found a repl that answer us :)
         while True:
             repls = kvmgr.get_my_replicats()
@@ -757,144 +689,22 @@ class Cluster(object):
                     continue
                 addr = repl['addr']
                 port = repl['port']
-                logger.log('SYNC try to sync from %s since the time %s' % (repl['name'], self.last_alive))
+                logger.info('SYNC try to sync from %s since the time %s' % (repl['name'], self.last_alive))
                 uri = 'http://%s:%s/kv-meta/changed/%d' % (addr, port, self.last_alive)
                 try:
                     r = httper.get(uri)
                     logger.debug("SYNC kv-changed response from %s " % repl['name'], len(r))
                     try:
-                        to_merge = json.loads(r)
-                    except (ValueError, TypeError), exp:
+                        to_merge = jsoner.loads(r)
+                    except (ValueError, TypeError) as exp:
                         logger.debug('SYNC : error asking to %s: %s' % (repl['name'], str(exp)))
                         continue
                     kvmgr.do_merge(to_merge)
                     logger.debug("SYNC thread done, bailing out")
                     return
-                except get_http_exceptions(), exp:
+                except get_http_exceptions() as exp:
                     logger.debug('SYNC : error asking to %s: %s' % (repl['name'], str(exp)))
                     continue
-            time.sleep(1)
-    
-    
-    # Thread that will look for libexec/configuration change events,
-    # will get the newest value in the KV and dump the files
-    def do_update_libexec_cfg_thread(self):
-        while not stopper.interrupted:
-            # work on a clean list
-            libexec_to_update = self.libexec_to_update
-            self.libexec_to_update = []
-            for (p, _hash) in libexec_to_update:
-                logger.debug("LIBEXEC WE NEED TO UPDATE THE LIBEXEC PATH", p, "with the hash", _hash)
-                fname = os.path.normpath(os.path.join(self.libexec_dir, p))
-                
-                # check if we are still in the libexec dir and not higer, somewhere
-                # like in a ~/.ssh or an /etc...
-                if not fname.startswith(self.libexec_dir):
-                    logger.log('WARNING (SECURITY): trying to update the path %s that is not in libexec dir, bailing out' % fname)
-                    continue
-                # If it exists, try to look at the _hash so maybe we don't have to load it again
-                if os.path.exists(fname):
-                    try:
-                        f = open(fname, 'rb')
-                        _lhash = hashlib.sha1(f.read()).hexdigest()
-                        f.close()
-                    except Exception, exp:
-                        logger.log('do_update_libexec_cfg_thread:: error in opening the %s file: %s' % (fname, exp))
-                        _lhash = ''
-                    if _lhash == _hash:
-                        logger.debug('LIBEXEC update, not need for the local file %s, hash are the same' % fname)
-                        continue
-                # ok here we need to load the KV value (a base64 tarfile)
-                v64 = kvmgr.get_key('__libexec/%s' % p)
-                if v64 is None:
-                    logger.log('WARNING: cannot load the libexec script from kv %s' % p)
-                    continue
-                vtar = base64.b64decode(v64)
-                f = cStringIO.StringIO(vtar)
-                with tarfile.open(fileobj=f, mode="r:gz") as tar:
-                    files = tar.getmembers()
-                    if len(files) != 1:
-                        logger.log('WARNING: too much files in a libexec KV entry %d' % len(files))
-                        continue
-                    _f = files[0]
-                    _fname = os.path.normpath(_f.name)
-                    if not _f.isfile() or os.path.isabs(_fname):
-                        logger.log(
-                            'WARNING: (security) invalid libexec KV entry (not a file or absolute path) for %s' % _fname)
-                        continue
-                    
-                    # ok the file is good, we can extract it
-                    tempdir = tempfile.mkdtemp()
-                    tar.extract(_f, path=tempdir)
-                    
-                    # now we can move all the tempdir content into the libexec dir
-                    to_move = os.listdir(tempdir)
-                    for e in to_move:
-                        copy_dir(os.path.join(tempdir, e), self.libexec_dir)
-                        logger.debug('LIBEXEC: we just upadte the %s file with a new version' % _fname)
-                    # we can clean the tempdir as we don't use it anymore
-                    shutil.rmtree(tempdir)
-                f.close()
-            
-            # Now the configuration part
-            configuration_to_update = self.configuration_to_update
-            self.configuration_to_update = []
-            for (p, _hash) in configuration_to_update:
-                logger.debug("CONFIGURATION WE NEED TO UPDATE THE CONFIGURATION PATH", p, "with the hash", _hash)
-                fname = os.path.normpath(os.path.join(self.configuration_dir, p))
-                
-                # check if we are still in the configuration dir and not higer, somewhere
-                # like in a ~/.ssh or an /etc...
-                if not fname.startswith(self.configuration_dir):
-                    logger.log(
-                        'WARNING (SECURITY): trying to update the path %s that is not in configuration dir, bailing out' % fname)
-                    continue
-                # If it exists, try to look at the _hash so maybe we don't have to load it again
-                if os.path.exists(fname):
-                    try:
-                        f = open(fname, 'rb')
-                        _lhash = hashlib.sha1(f.read()).hexdigest()
-                        f.close()
-                    except Exception, exp:
-                        logger.log(
-                            'do_update_configuration_cfg_thread:: error in opening the %s file: %s' % (fname, exp))
-                        _lhash = ''
-                    if _lhash == _hash:
-                        logger.debug(
-                            'CONFIGURATION update, not need for the local file %s, hash are the same' % fname)
-                        continue
-                # ok here we need to load the KV value (a base64 tarfile)
-                v64 = kvmgr.get_key('__configuration/%s' % p)
-                if v64 is None:
-                    logger.log('WARNING: cannot load the configuration script from kv %s' % p)
-                    continue
-                vtar = base64.b64decode(v64)
-                f = cStringIO.StringIO(vtar)
-                with tarfile.open(fileobj=f, mode="r:gz") as tar:
-                    files = tar.getmembers()
-                    if len(files) != 1:
-                        logger.log('WARNING: too much files in a configuration KV entry %d' % len(files))
-                        continue
-                    _f = files[0]
-                    _fname = os.path.normpath(_f.name)
-                    if not _f.isfile() or os.path.isabs(_fname):
-                        logger.log(
-                            'WARNING: (security) invalid configuration KV entry (not a file or absolute path) for %s' % _fname)
-                        continue
-                    # ok the file is good, we can extract it
-                    tempdir = tempfile.mkdtemp()
-                    tar.extract(_f, path=tempdir)
-                    
-                    # now we can move all the tempdir content into the configuration dir
-                    to_move = os.listdir(tempdir)
-                    for e in to_move:
-                        copy_dir(os.path.join(tempdir, e), self.configuration_dir)
-                        logger.debug('CONFIGURATION: we just upadte the %s file with a new version' % _fname)
-                    # we can clean the tempdir as we don't use it anymore
-                    shutil.rmtree(tempdir)
-                f.close()
-            
-            # We finish to load all, we take a bit sleep now...
             time.sleep(1)
     
     
@@ -947,159 +757,29 @@ class Cluster(object):
             logger.info('Cleaning lock file at %s' % self.lock_path)
             try:
                 os.unlink(self.lock_path)
-            except Exception, exp:
+            except Exception as exp:
                 logger.error('Cannot remove lock file %s: %s' % (self.lock_path, exp))
     
     
-    def stack_event_broadcast(self, payload):
-        msg = gossiper.create_event_msg(payload)
-        b = {'send': 0, 'msg': msg}
-        broadcaster.broadcasts.append(b)
-        return
-    
-    
-    # interface for manage_message, in pubsub
-    def manage_message_pub(self, msg=None):
-        if msg is None:
-            return
-        self.manage_message(msg)
-    
-    
-    # Manage a udp message
-    def manage_message(self, m):
-        logger.debug('MESSAGE %s' % m)
-        t = m.get('type', None)
-        if t is None:  # bad message, skip it
-            return
-        if t == 'ack':
-            logger.debug("GOT AN ACK?")
-        elif t == 'alive':
-            gossiper.set_alive(m)
-        elif t in ['suspect', 'dead']:
-            gossiper.set_suspect(m)
-        elif t == 'leave':
-            gossiper.set_leave(m)
-        elif t == 'event':
-            self.manage_event(m)
-        else:
-            logger.error('UNKNOWN MESSAGE', m)
-    
-    
-    def manage_event(self, m):
-        eventid = m.get('eventid', '')
-        payload = m.get('payload', {})
-        # if bad event or already known one, delete it
-        with self.events_lock:
-            if not eventid or not payload or eventid in self.events:
-                return
-        # ok new one, add a broadcast so we diffuse it, and manage it
-        b = {'send': 0, 'msg': m}
-        broadcaster.broadcasts.append(b)
-        with self.events_lock:
-            self.events[eventid] = m
-        
-        # I am the sender for this event, do not handle it
-        if m.get('from', '') == self.uuid:
-            return
-        
-        _type = payload.get('type', '')
-        if not _type:
-            return
-        
-        # If we got a libexec file update message, we append this path to the list 
-        # libexec_to_update so a thread will grok the new version from KV
-        if _type == 'libexec':
-            path = payload.get('path', '')
-            _hash = payload.get('hash', '')
-            if not path or not _hash:
-                return
-            logger.debug('LIBEXEC UPDATE asking update for the path %s wit the hash %s' % (path, _hash))
-            self.libexec_to_update.append((path, _hash))
-        # Ok but for the configuration part this time
-        elif _type == 'configuration':
-            path = payload.get('path', '')
-            _hash = payload.get('hash', '')
-            if not path or not _hash:
-                return
-            if 'path' == 'local.json':
-                # We DONT update our local.json file, it's purely local
-                return
-            logger.debug('CONFIGURATION UPDATE asking update for the path %s wit the hash %s' % (path, _hash))
-            self.configuration_to_update.append((path, _hash))
-        # Maybe we are ask to clean our configuration, if so launch a thread because we can't block this
-        # thread while doing it
-        elif _type == 'configuration-cleanup':
-            threader.create_and_launch(self.do_configuration_cleanup, name='configuration-cleanup')
-        else:
-            logger.debug('UNKNOWN EVENT %s' % m)
-            return
-    
-    
-    # Look at the /kv/configuration/ entry, uncompress the json string
-    # and clean old files into the configuration directory that is not in this list
-    # but not the local.json that is out of global conf
-    def do_configuration_cleanup(self):
-        zj64 = kvmgr.get_key('__configuration')
-        if zj64 is None:
-            logger.log('WARNING cannot grok kv/__configuration entry')
-            return
-        zj = base64.b64decode(zj64)
-        j = zlib.decompress(zj)
-        lst = json.loads(j)
-        logger.debug("WE SHOULD CLEANUP all but not", lst)
-        local_files = [os.path.join(dp, f)
-                       for dp, dn, filenames in os.walk(os.path.abspath(self.configuration_dir))
-                       for f in filenames]
-        for fname in local_files:
-            path = fname[len(os.path.abspath(self.configuration_dir)) + 1:]
-            # Ok, we should not have the local.json entry, but even if we got it, do NOT rm it
-            if path == 'local.json':
-                continue
-            if path not in lst:
-                full_path = os.path.join(self.configuration_dir, path)
-                logger.debug("CLEANUP we should clean the file", full_path)
-                try:
-                    os.remove(full_path)
-                except OSError, exp:
-                    logger.log('WARNING: cannot cleanup the configuration file %s (%s)' % (full_path, exp))
-    
-    
     # We are joining the seed members and lock until we reach at least one
-    def join(self):
-        gossiper.join()
+    @staticmethod
+    def _join(force_wait_proxy):
+        if topiker.is_topic_enabled(TOPIC_SERVICE_DISCOVERY):
+            gossiper.join_bootstrap(force_wait_proxy)
     
     
-    # each second we look for all old events in order to clean and delete them :)
-    def clean_old_events(self):
-        now = int(time.time())
-        to_del = []
-        with self.events_lock:
-            for (cid, e) in self.events.iteritems():
-                ctime = e.get('ctime', 0)
-                if ctime < now - self.max_event_age:
-                    to_del.append(cid)
-        # why sleep here? because I don't want to take the lock twice as quick is an udp thread
-        # is also waiting for it, he is prioritary, not me
-        time.sleep(0.01)
-        with self.events_lock:
-            for cid in to_del:
-                try:
-                    del self.events[cid]
-                except IndexError:  # if already delete, we don't care
-                    pass
-    
-    
-    def do_memory_trim_thread(self):
+    @staticmethod
+    def do_memory_trim_thread():
         try:
             import ctypes
         except ImportError:  # like in static python
             ctypes = None
-            
+        
         if ctypes is None:  # nop
-            while not stopper.interrupted:
+            while not stopper.is_stop():
                 time.sleep(10)
             return
-            
+        
         import gc
         
         try:
@@ -1112,7 +792,7 @@ class Cluster(object):
         gc.disable()
         gen = 0
         _i = 0
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             _i += 1
             gen += 1
             gen %= 2
@@ -1130,39 +810,37 @@ class Cluster(object):
     
     
     def update_agent_state(self):
-        if self.agent_state == AGENT_STATE_INITIALIZING:
+        if self.agent_state == AGENT_STATES.AGENT_STATE_INITIALIZING:
             b = True
             b &= collectormgr.did_run
             b &= detecter.did_run
             b &= generatormgr.did_run
-            b &= installormgr.did_run
             b &= compliancemgr.did_run
             if b:
-                self.agent_state = AGENT_STATE_OK
+                self._set_agent_state(AGENT_STATES.AGENT_STATE_OK)
     
     
     # In one shot mode, we want to be sure the theses parts did run at least once:
     # collector
     # detector
     # generator
-    # installor
     # compliance
     def wait_one_shot_end(self):
-        while self.agent_state == AGENT_STATE_INITIALIZING:
+        while self.agent_state == AGENT_STATES.AGENT_STATE_INITIALIZING:
             self.update_agent_state()
             time.sleep(0.1)
         
         # Ok all did launched, we can quit
         
         # Ok let's know the whole system we are going to stop
-        stopper.interrupted = True
-        
-        logger.info('One shot execution did finish to look at jobs, exiting')
+        msg = 'One shot execution did finish to look at jobs, exiting'
+        stopper.do_stop(msg)
+        logger.info(msg)
     
     
     def __exit_path(self):
         # Change the agent_state to stopped
-        self.agent_state = AGENT_STATE_STOPPED
+        self._set_agent_state(AGENT_STATES.AGENT_STATE_STOPPED)
         
         # Maybe the modules want a special call
         modulemanager.stopping_agent()
@@ -1179,20 +857,21 @@ class Cluster(object):
     # Guess what? yes, it is the main function
     # One shot option is for an execution that is just doing some stuff and then exit
     # so without having to start all the listening part
-    def main(self, one_shot=False):
+    def main(self, one_shot=False, force_wait_proxy=False):
         # gossip UDP and the whole HTTP part is useless in a oneshot execution
         if not one_shot:
             logger.info('Launching listeners')
-            self.launch_gossip_listener()
+            get_udp_listener().launch_gossip_listener(self.addr, self.listening_addr, self.port)
             self.launch_http_listeners()
             # We need to have modules if need, maybe one of them can do something when exiting
             # but in one shot we only call them at the stop, without allow them to spawn their thread
             self.launch_modules_threads()
+            self.launch_pinghome_thread()
         
         # joining is for gossip part, useless in a oneshot run
         if not one_shot:
             logger.info('Joining seeds nodes')
-            self.join()
+            self._join(force_wait_proxy)
         
         logger.info('Starting check, collector and generator threads')
         
@@ -1204,7 +883,6 @@ class Cluster(object):
         if not one_shot:
             self.launch_check_thread()
         
-        self.launch_installor_thread()
         self.launch_compliance_thread()
         
         if 'kv' in gossiper.groups and not one_shot:
@@ -1229,6 +907,8 @@ class Cluster(object):
             threader.create_and_launch(gossiper.ping_another_nodes, name='Ping other nodes', essential=True, part='gossip')
             threader.create_and_launch(gossiper.do_launch_gossip_loop, name='Cluster messages broadcasting', essential=True, part='gossip')
             threader.create_and_launch(gossiper.launch_full_sync_loop, name='Nodes full synchronization', essential=True, part='gossip')
+            threader.create_and_launch(gossiper.do_history_save_loop, name='Nodes history writing', essential=True, part='gossip')
+            threader.create_and_launch(get_rafter().do_raft_thread, name='Raft managment', essential=True, part='raft')
         
         if one_shot:
             self.wait_one_shot_end()
@@ -1237,7 +917,7 @@ class Cluster(object):
         
         logger.info('Go go run!')
         i = -1
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             i += 1
             if i % 10 == 0:
                 logger.debug('KNOWN NODES: %d, alive:%d, suspect:%d, dead:%d, leave:%d' % (
@@ -1250,8 +930,6 @@ class Cluster(object):
             gossiper.look_at_deads()
             
             self.retention_nodes()
-            
-            self.clean_old_events()
             
             # Look if we lost some threads or not
             threader.check_alives()

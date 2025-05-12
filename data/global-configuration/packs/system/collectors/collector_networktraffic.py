@@ -1,8 +1,11 @@
 import sys
 import re
 import traceback
-import time
 import os
+
+PY3 = sys.version_info >= (3,)
+if PY3:
+    long = int
 
 from opsbro.collector import Collector
 from opsbro.now import NOW
@@ -38,7 +41,7 @@ class NetworkTraffic(Collector):
                 data[_label] = v
             return data
         
-        if sys.platform == 'linux2':
+        if sys.platform.startswith('linux'):
             logger.debug('getNetworkTraffic: linux2')
             
             try:
@@ -47,7 +50,7 @@ class NetworkTraffic(Collector):
                 lines = proc.readlines()
                 proc.close()
             
-            except IOError, e:
+            except IOError as e:
                 logger.error('getNetworkTraffic: exception = %s', e)
                 return False
             
@@ -55,8 +58,8 @@ class NetworkTraffic(Collector):
             
             columnLine = lines[1]
             _, receiveCols, transmitCols = columnLine.split('|')
-            receiveCols = map(lambda a: 'recv_' + a, receiveCols.split())
-            transmitCols = map(lambda a: 'trans_' + a, transmitCols.split())
+            receiveCols = list(map(lambda a: 'recv_' + a, receiveCols.split()))
+            transmitCols = list(map(lambda a: 'trans_' + a, transmitCols.split()))
             
             cols = receiveCols + transmitCols
             
@@ -110,9 +113,9 @@ class NetworkTraffic(Collector):
                     logger.debug('getNetworkTraffic: %s = %s' % (key, self.networkTrafficStore[key]['recv_bytes']))
                     logger.debug('getNetworkTraffic: %s = %s' % (key, self.networkTrafficStore[key]['trans_bytes']))
                 
-                except KeyError, ex:
+                except KeyError as ex:
                     logger.error('getNetworkTraffic: no data for %s' % key)
-                except ValueError, ex:
+                except ValueError as ex:
                     logger.error('getNetworkTraffic: invalid data for %s' % key)
             
             logger.debug('getNetworkTraffic: completed, returning')
@@ -131,10 +134,10 @@ class NetworkTraffic(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                 
-                except Exception, e:
+                except Exception as e:
                     logger.error('getNetworkTraffic: exception = %s', traceback.format_exc())
                     
                     return False
@@ -142,7 +145,7 @@ class NetworkTraffic(Collector):
                 if int(pythonVersion[1]) >= 6:
                     try:
                         proc.kill()
-                    except Exception, e:
+                    except Exception as e:
                         logger.debug('Process already terminated')
             
             logger.debug('getNetworkTraffic: open success, parsing')
@@ -180,7 +183,7 @@ class NetworkTraffic(Collector):
                             
                             face = line[0]
                             faces[face] = faceData
-                        except IndexError, e:
+                        except IndexError as e:
                             continue
             
             logger.debug('getNetworkTraffic: parsed, looping')
@@ -219,10 +222,10 @@ class NetworkTraffic(Collector):
                         self.networkTrafficStore[key]['recv_bytes'] = faces[face]['recv_bytes']
                         self.networkTrafficStore[key]['trans_bytes'] = faces[face]['trans_bytes']
                 
-                except KeyError, ex:
+                except KeyError as ex:
                     logger.error('getNetworkTraffic: no data for %s', key)
                 
-                except ValueError, ex:
+                except ValueError as ex:
                     logger.error('getNetworkTraffic: invalid data for %s', key)
             
             logger.debug('getNetworkTraffic: completed, returning')
@@ -230,6 +233,5 @@ class NetworkTraffic(Collector):
             return interfaces
         
         else:
-            logger.debug('getNetworkTraffic: other platform, returning')
-            
+            self.set_not_eligible('This system is not managed by this collector.')
             return False

@@ -1,0 +1,6 @@
+detector:
+    add_groups:
+        - vmware
+    apply_if: "{{collector.hypervisor.hypervisor}} == 'VMwareVMware'"
+    interval: "3600s"
+

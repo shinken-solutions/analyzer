@@ -1,6 +1,5 @@
 import os
 import re
-import commands
 
 from opsbro.collector import Collector
 
@@ -43,7 +42,7 @@ class Interfaces(Collector):
         res = {}
         for pth in ["/bin/ifconfig", "/sbin/ifconfig", "/usr/sbin/ifconfig"]:
             if os.path.exists(pth):
-                status, output = commands.getstatusoutput('%s -a' % pth)
+                status, output = self.execute_shell_and_state('%s -a' % pth)
                 if status != 0:
                     return res
                 paragraphs = output.split('\n\n')
@@ -52,5 +51,5 @@ class Interfaces(Collector):
                     if 'interface' in r:
                         res[r['interface']] = r
                 return res
-        
+        self.set_not_eligible('Your system is not managed, missing the ifconfig command.')
         return res

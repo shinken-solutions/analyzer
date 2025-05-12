@@ -1,6 +1,0 @@
-detector:
-    add_groups:
-        - virtualbox
-    apply_if: "{{collector.hypervisor.hypervisor}} == 'VBoxVBoxVBox'"
-    interval: "10s"
-

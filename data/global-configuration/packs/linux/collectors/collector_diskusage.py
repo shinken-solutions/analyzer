@@ -11,12 +11,19 @@ class DiskUsage(Collector):
         
         # logger.debug('getDiskUsage: attempting Popen')
         if os.name == 'nt':
+            self.set_not_eligible('This collector is not availabe on windows currently.')
             return False
         
+        # We are asking for calling the df call but there is a trap:
+        # * classic linux, manage -x
+        # * embedded and co, cannot manage -x
         _cmd = 'df -k -x smbfs -x tmpfs -x cifs -x iso9660 -x udf -x nfsv4 -x udev -x devtmpfs'
-        df = self.execute_shell(_cmd)
+        df = self.execute_shell(_cmd, if_fail_set_error=False)
         if not df:
-            return False
+            _cmd = 'df -k'
+            df = self.execute_shell(_cmd, if_fail_set_error=False)
+            if not df:
+                return False
         
         # logger.debug('getDiskUsage: Popen success, start parsing')
         
@@ -53,7 +60,7 @@ class DiskUsage(Collector):
                 previousVolume = volume[0]  # We store it, then continue the for
                 continue
             
-            if previousVolume != None:  # If the previousVolume was set (above) during the last loop
+            if previousVolume is not None:  # If the previousVolume was set (above) during the last loop
                 volume.insert(0, previousVolume)  # then we need to insert it into the volume
                 previousVolume = None  # then reset so we don't use it again
             
@@ -73,7 +80,7 @@ class DiskUsage(Collector):
                     volume[1] = int(volume[1]) / 1024  # total
                     volume[2] = int(volume[2]) / 1024  # Used
                     volume[3] = int(volume[3]) / 1024  # Available
-                except Exception, e:
+                except Exception as e:
                     logger.error('getDiskUsage: parsing, loop %s - Used or Available not present' % (repr(e),))
                 d['total'] = volume[1]
                 d['used'] = volume[2]

@@ -1,0 +1,20 @@
+FROM       naparuba/debian-9
+MAINTAINER Jean Gabes <naparuba@gmail.com>
+
+ADD        test/docker-helper/  /
+
+
+# For nagios checks, we need nagios plugins
+RUN        /apt_get_install  nagios-plugins-standard
+
+ADD        . /root/opsbro-oss
+
+
+WORKDIR       /root/opsbro-oss
+
+RUN       python setup.py install
+
+# Copy the new checks
+ADD        test/test-files/test-nagios-checks   /var/lib/opsbro/global-configuration/packs/
+
+ENTRYPOINT     test/test_feature_nagios_checks.sh

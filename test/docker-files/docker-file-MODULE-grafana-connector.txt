@@ -1,0 +1,28 @@
+FROM       naparuba/debian-9
+MAINTAINER Jean Gabes <naparuba@gmail.com>
+
+ADD        test/docker-helper/  /
+
+
+# Grafana: setup its repo for debian (same for all debian releases)
+RUN        /apt_get_install  curl
+RUN        /apt_get_install  apt-transport-https
+RUN        /apt_get_install  gnupg
+RUN        printf "\ndeb https://packagecloud.io/grafana/stable/debian/ jessie main\n" >> /etc/apt/sources.list
+RUN        curl https://packagecloud.io/gpg.key | apt-key add -
+RUN        /apt_get_install  grafana
+RUN        /apt_get_install  procps
+RUN        /apt_get_install  net-tools
+RUN        /apt_get_install  sqlite
+
+ADD        . /root/opsbro-oss
+WORKDIR       /root/opsbro-oss
+
+RUN       python setup.py install
+
+
+# For manuel testing purpose only, not need by the automatic test
+EXPOSE    3000:3000
+
+
+ENTRYPOINT     test/test_module_grafana_connector.sh

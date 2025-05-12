@@ -35,12 +35,12 @@ class Memory(Collector):
             return data
         
         # If Linux like procfs system is present and mounted we use meminfo, else we use "native" mode (vmstat and swapinfo)
-        if sys.platform == 'linux2':
+        if sys.platform.startswith('linux'):
             # logger.debug('getMemoryUsage: linux2')
             try:
                 with open('/proc/meminfo', 'r') as meminfoProc:
                     lines = meminfoProc.readlines()
-            except IOError, e:
+            except IOError as e:
                 logger.error('getMemoryUsage: exception = %s', e)
                 return False
             
@@ -57,7 +57,7 @@ class Memory(Collector):
                     # We are only interested in the KB data so regexp that out
                     match = re.search(regexp, values[1])
                     
-                    if match != None:
+                    if match is not None:
                         meminfo[str(values[0])] = int(match.group(0))
                 except IndexError:
                     break
@@ -78,7 +78,7 @@ class Memory(Collector):
                 # logger.debug('getMemoryUsage: formatting (phys)')
                 
                 physTotal = meminfo['memtotal']
-                physFree = meminfo['memfree'] + meminfo['buffers'] + meminfo['cached']
+                physFree = meminfo['memfree'] + meminfo['buffers'] + meminfo['cached'] + meminfo['sreclaimable']  # also count io cache and system one (slab)
                 physUsed = 100 * (physTotal - float(physFree)) / physTotal
                 
                 # Convert to MB
@@ -130,7 +130,7 @@ class Memory(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                     
                     sysinfo = sysinfo.split('\n')
@@ -163,15 +163,15 @@ class Memory(Collector):
                                     cached = match.group(0)
                                     logger.debug('getMemoryUsage: sysinfo: found cached %s', cached)
                 
-                except OSError, e:
+                except OSError as e:
                     logger.debug('getMemoryUsage: sysinfo not available')
-                except Exception, e:
+                except Exception as e:
                     logger.error('getMemoryUsage: exception = %s', traceback.format_exc())
             finally:
                 if int(pythonVersion[1]) >= 6:
                     try:
                         proc.kill()
-                    except Exception, e:
+                    except Exception as e:
                         logger.debug('Process already terminated')
             
             if physFree == None:
@@ -188,7 +188,7 @@ class Memory(Collector):
                         if int(pythonVersion[1]) >= 6:
                             try:
                                 proc.kill()
-                            except Exception, e:
+                            except Exception as e:
                                 logger.debug('Process already terminated')
                         
                         logger.debug('getMemoryUsage: attempting Popen (vmstat)')
@@ -198,10 +198,10 @@ class Memory(Collector):
                         if int(pythonVersion[1]) >= 6:
                             try:
                                 proc.kill()
-                            except Exception, e:
+                            except Exception as e:
                                 logger.debug('Process already terminated')
                     
-                    except Exception, e:
+                    except Exception as e:
                         logger.error('getMemoryUsage: exception = %s', traceback.format_exc())
                         
                         return False
@@ -209,7 +209,7 @@ class Memory(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                 
                 logger.debug('getMemoryUsage: Popen success, parsing')
@@ -253,10 +253,10 @@ class Memory(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                 
-                except Exception, e:
+                except Exception as e:
                     logger.error('getMemoryUsage: exception = %s', traceback.format_exc())
                     
                     return False
@@ -264,7 +264,7 @@ class Memory(Collector):
                 if int(pythonVersion[1]) >= 6:
                     try:
                         proc.kill()
-                    except Exception, e:
+                    except Exception as e:
                         logger.debug('Process already terminated')
             
             lines = swapinfo.split('\n')
@@ -278,7 +278,7 @@ class Memory(Collector):
                     try:
                         swapUsed += int(swapParts[len(swapParts) - 3]) / 1024
                         swapFree += int(swapParts[len(swapParts) - 2]) / 1024
-                    except IndexError, e:
+                    except IndexError as e:
                         pass
             
             logger.debug('getMemoryUsage: parsed swapinfo, completed, returning')
@@ -299,7 +299,7 @@ class Memory(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                     
                     logger.debug('getMemoryUsage: attempting Popen (sysctl)')
@@ -309,17 +309,17 @@ class Memory(Collector):
                     if int(pythonVersion[1]) >= 6:
                         try:
                             proc.kill()
-                        except Exception, e:
+                        except Exception as e:
                             logger.debug('Process already terminated')
                 
-                except Exception, e:
+                except Exception as e:
                     logger.error('getMemoryUsage: exception = %s', traceback.format_exc())
                     return False
             finally:
                 if int(pythonVersion[1]) >= 6:
                     try:
                         proc.kill()
-                    except Exception, e:
+                    except Exception as e:
                         logger.debug('Process already terminated')
             
             logger.debug('getMemoryUsage: Popen success, parsing')
@@ -339,5 +339,5 @@ class Memory(Collector):
                     'swapFree': swapParts[2], 'cached': 'NULL'}
         
         else:
-            logger.debug('getMemoryUsage: other platform, returning')
+            self.set_not_eligible('This system is not managed by this collector.')
             return False

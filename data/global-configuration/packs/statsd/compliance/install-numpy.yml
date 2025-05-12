@@ -1,0 +1,21 @@
+compliance:
+   name: Install numpy if statsd module enabled
+   verify_if:   "is_in_group('statsd-listener')"
+   mode: enforcing
+   interval: 1s
+   note: This installer will install the the python numpy librairy is the statsd module goes enabled
+   rule:
+      type: package-install
+      environments:
+      # Python3 have a special package name of course...
+       - name: linux_python3
+         if:   "system_get_os() == 'linux' and system_is_python_3()"
+         parameters:
+            packages:
+              - python3-numpy
+       - name: linux
+         if:   "system_get_os() == 'linux'"
+         parameters:
+            packages:
+              - python-numpy
+

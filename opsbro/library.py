@@ -5,14 +5,25 @@ class LibraryStore(object):
         self.__jinja2 = None
         self.__pprint = None
         self.__pygments = None
+        self.__StringIO = None
+        self.__StringIO_unicode = None  # unicode compliant version
+        self._processtitler = None
     
     
     def get_encrypter(self):
         if self.__encrypter is not None:
             return self.__encrypter
-        from opsbro.encrypter import get_encrypter
+        from .encrypter import get_encrypter
         self.__encrypter = get_encrypter()
         return self.__encrypter
+    
+    
+    def get_processtitler(self):
+        if self._processtitler is not None:
+            return self._processtitler
+        from .processtitle import get_processtitler
+        self._processtitler = get_processtitler()
+        return self._processtitler
     
     
     def get_requests(self):
@@ -54,6 +65,28 @@ class LibraryStore(object):
             pygments = None
         self.__pygments = pygments
         return self.__pygments
+    
+    
+    def get_StringIO(self):
+        if self.__StringIO is not None:
+            return self.__StringIO
+        try:
+            from cStringIO import StringIO
+        except ImportError:  # Python3
+            from io import StringIO
+        self.__StringIO = StringIO
+        return self.__StringIO
+    
+    
+    def get_StringIO_unicode_compatible(self):
+        if self.__StringIO_unicode is not None:
+            return self.__StringIO_unicode
+        try:
+            from StringIO import StringIO
+        except ImportError:  # Python3
+            from io import StringIO
+        self.__StringIO_unicode = StringIO
+        return self.__StringIO_unicode
 
 
 libstore = LibraryStore()

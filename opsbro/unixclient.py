@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2014:
@@ -7,23 +6,39 @@
 
 
 import os
-import json
 import socket
-import urllib2
-import urllib
-import httplib
-from urlparse import urlsplit
 
-from opsbro.log import logger
-from opsbro.library import libstore
+try:  # Python 2
+    from urllib2 import AbstractHTTPHandler, Request, build_opener, URLError, HTTPHandler
+except ImportError:  # Python 3
+    from urllib.request import AbstractHTTPHandler, Request, build_opener, HTTPHandler
+    from urllib.error import URLError
+try:  # Python 2
+    from httplib import HTTPConnection
+except ImportError:  # Python 3
+    from http.client import HTTPConnection
+
+try:
+    from urllib import urlencode
+except ImportError:
+    from urllib.parse import urlencode
+
+try:  # Python 2
+    from urlparse import urlsplit
+except ImportError:
+    from urllib.parse import urlsplit
+
+from .log import logger
+from .jsonmgr import jsoner
+from .util import string_encode, string_decode
 
 #### For local socket handling
 DEFAULT_SOCKET_TIMEOUT = 5
 
 
-# Class used in conjuction with UnixSocketHandler to make urllib2
+# Class used in conjuction with UnixSocketHandler to make urllib
 # compatible with Unix sockets.
-class UnixHTTPConnection(httplib.HTTPConnection):
+class UnixHTTPConnection(HTTPConnection):
     socket_timeout = DEFAULT_SOCKET_TIMEOUT
     
     
@@ -39,13 +54,23 @@ class UnixHTTPConnection(httplib.HTTPConnection):
     
     
     def __call__(self, *args, **kwargs):
-        httplib.HTTPConnection.__init__(self, *args, **kwargs)
+        HTTPConnection.__init__(self, *args, **kwargs)
         return self
 
 
-# Class that makes Unix sockets work with urllib2 without any additional
+# Class that makes Unix sockets work with urllib without any additional
 # dependencies.
-class UnixSocketHandler(urllib2.AbstractHTTPHandler):
+class UnixSocketHandler(AbstractHTTPHandler):
+    
+    @staticmethod
+    def __get_req_data(req):
+        # Python 2:
+        if hasattr(req, 'get_data'):
+            return req.get_data()
+        # Python 3
+        return req.data
+    
+    
     def unix_open(self, req):
         full_path = "%s%s" % urlsplit(req.get_full_url())[1:3]
         path = os.path.sep
@@ -56,43 +81,44 @@ class UnixSocketHandler(urllib2.AbstractHTTPHandler):
                 break
             unix_socket = path
         
-        # add a host or else urllib2 complains
+        # add a host or else urllib complains
         url = req.get_full_url().replace(unix_socket, "/localhost")
-        new_req = urllib2.Request(url, req.get_data(), dict(req.header_items()))
+        new_req = Request(url, self.__get_req_data(req), dict(req.header_items()))
         new_req.timeout = req.timeout
         new_req.get_method = req.get_method  # Also copy specific method from the original header
         return self.do_open(UnixHTTPConnection(unix_socket), new_req)
     
     
-    unix_request = urllib2.AbstractHTTPHandler.do_request_
+    unix_request = AbstractHTTPHandler.do_request_
 
 
 # Get on the local socket. Beware to monkeypatch the get
-def get_local(u, local_socket, params={}, method='GET'):
-    UnixHTTPConnection.socket_timeout = 5
+def get_local(u, local_socket, params={}, method='GET', timeout=10):
+    UnixHTTPConnection.socket_timeout = timeout
     data = None
     special_headers = []
     
     if method == 'GET' and params:
-        u = "%s?%s" % (u, urllib.urlencode(params))
+        u = "%s?%s" % (u, urlencode(params))
     if method == 'POST' and params:
-        data = urllib.urlencode(params)
+        data = string_encode(urlencode(params))
     if method == 'PUT' and params:
         special_headers.append(('Content-Type', 'your/contenttype'))
-        data = params
+        data = string_encode(params)
     
     # not the same way to connect
     # * windows: TCP
     # * unix   : unix socket
     if os.name == 'nt':
-        url_opener = urllib2.build_opener(urllib2.HTTPHandler)
+        url_opener = build_opener(HTTPHandler)
         uri = 'http://127.0.0.1:6770%s' % u
     else:  # unix
-        url_opener = urllib2.build_opener(UnixSocketHandler())
+        url_opener = build_opener(UnixSocketHandler())
         uri = 'unix:/%s%s' % (local_socket, u)
     
     logger.debug("Connecting to local http/unix socket at: %s with method %s" % (uri, method))
-    req = urllib2.Request(uri, data)
+    
+    req = Request(uri, data)
     req.get_method = lambda: method
     for (k, v) in special_headers:
         req.add_header(k, v)
@@ -102,18 +128,25 @@ def get_local(u, local_socket, params={}, method='GET'):
     return (code, response)
 
 
+def get_not_critical_request_errors():
+    return (socket.timeout,)
+
+
 def get_request_errors():
-    request_errors = (urllib2.URLError, )
+    request_errors = (URLError, socket.timeout, socket.error)
     return request_errors
 
 
 # get a json on the local server, and parse the result    
-def get_json(uri, local_socket='', params={}, multi=False, method='GET'):
+def get_json(uri, local_socket='', params={}, multi=False, method='GET', timeout=10):
     try:
-        (code, r) = get_local(uri, local_socket=local_socket, params=params, method=method)
-    except get_request_errors(), exp:
+        (code, r) = get_local(uri, local_socket=local_socket, params=params, method=method, timeout=timeout)
+    except get_request_errors() as exp:
         logger.debug("ERROR local unix get json raw return did raise an exception %s" % exp)
         raise
+    
+    # From bytes to string
+    r = string_decode(r)
     
     if r == '':
         return r
@@ -123,8 +156,8 @@ def get_json(uri, local_socket='', params={}, multi=False, method='GET'):
         r = "[{0}]".format(r.replace("}{", "},{"))
     
     try:
-        d = json.loads(r)
-    except ValueError, exp:  # bad json
+        d = jsoner.loads(r)
+    except Exception as exp:  # bad json
         logger.debug("ERROR local unix get json raw return did raise an exception  in bad json (%s) %s" % (r, exp))
         logger.error('Bad return from the server %s: "%s"' % (exp, r))
         raise

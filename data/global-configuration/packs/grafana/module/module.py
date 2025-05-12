@@ -1,4 +1,3 @@
-import json
 import time
 
 from opsbro.module import ConnectorModule
@@ -7,6 +6,7 @@ from opsbro.threadmgr import threader
 from opsbro.stop import stopper
 from opsbro.gossip import gossiper
 from opsbro.httpclient import get_http_exceptions, httper
+from opsbro.jsonmgr import jsoner
 
 
 class GrafanaModule(ConnectorModule):
@@ -50,7 +50,7 @@ class GrafanaModule(ConnectorModule):
         try:
             r = httper.post(uri, params=entry, headers=self.__get_headers())
             self.logger.debug("Result insert", r)
-        except get_http_exceptions(), exp:
+        except get_http_exceptions() as exp:
             self.logger.error('Cannot connect to grafana datasources: %s' % exp)
             return
     
@@ -61,7 +61,7 @@ class GrafanaModule(ConnectorModule):
         try:
             r = httper.delete(uri, headers=self.__get_headers())
             self.logger.debug("Result delete", r)
-        except get_http_exceptions(), exp:
+        except get_http_exceptions() as exp:
             self.logger.error('Cannot connect to grafana datasources: %s' % exp)
             return
     
@@ -72,11 +72,11 @@ class GrafanaModule(ConnectorModule):
         try:
             api_return = httper.get(uri, headers=self.__get_headers())
             try:
-                all_data_sources = json.loads(api_return)
-            except (ValueError, TypeError), exp:
+                all_data_sources = jsoner.loads(api_return)
+            except (ValueError, TypeError) as exp:
                 self.logger.error('Cannot load json from grafana datasources: %s' % exp)
                 return None
-        except get_http_exceptions(), exp:
+        except get_http_exceptions() as exp:
             self.logger.error('Cannot connect to grafana datasources: %s' % exp)
             return None
         self.logger.debug("All data sources")
@@ -122,7 +122,7 @@ class GrafanaModule(ConnectorModule):
     
     
     def do_launch(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             self.logger.debug('Grafana loop')
             
             # We go in enabled when, and only when our group is matching what we do expect
@@ -142,8 +142,8 @@ class GrafanaModule(ConnectorModule):
                 time.sleep(1)
                 continue
             nodes_in_grafana_set = set(nodes_in_grafana.keys())
-            with gossiper.nodes_lock:
-                gossip_nodes_uuids = gossiper.nodes.keys()
+
+            gossip_nodes_uuids = gossiper.nodes.keys()  # note: nodes is a static dict, no need to lock it
             gossip_nodes_uuids = set(gossip_nodes_uuids)
             
             self.logger.debug("Nodes in grafana", nodes_in_grafana_set)

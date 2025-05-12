@@ -1,11 +1,12 @@
 import socket
 
+from .util import string_encode
+
 UDP_IP = "192.168.56.104"
 UDP_PORT = 18125  # curently disable
 
 
 ### Don't espect this part to work on your server without modifing the IP :)
-
 
 
 # gauge = ' moncul.cpu.used : 90 |g'
@@ -23,7 +24,8 @@ class Stats(object):
     def stack(self, s):
         self.buf.append(s)
         if len(self.buf) > 20:
-            self.sock.sendto('\n'.join(self.buf), (UDP_IP, UDP_PORT))
+            pkt = string_encode('\n'.join(self.buf))
+            self.sock.sendto(pkt, (UDP_IP, UDP_PORT))
             self.buf = []
     
     
@@ -45,7 +47,7 @@ class Stats(object):
     
     
     def show(self):
-        return ', '.join(['%s:%.4f' % (k, v) for (k, v) in self.stats.iteritems()])
+        return ', '.join(['%s:%.4f' % (k, v) for (k, v) in self.stats.items()])
 
 
 STATS = Stats()

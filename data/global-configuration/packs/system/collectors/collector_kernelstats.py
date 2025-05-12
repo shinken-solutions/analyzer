@@ -1,5 +1,4 @@
 import sys
-import time
 import os
 
 from opsbro.collector import Collector
@@ -19,7 +18,7 @@ class KernelStats(Collector):
     def launch(self):
         logger = self.logger
         now = int(NOW.monotonic())
-        diff = now - self.last_launch  #note: thanks to monotonic, diff cannot be negative
+        diff = now - self.last_launch  # note: thanks to monotonic, diff cannot be negative
         self.last_launch = now
         
         logger.debug('getKernelStats: start')
@@ -38,7 +37,7 @@ class KernelStats(Collector):
                 data[_label] = v
             return data
         
-        if sys.platform == 'linux2':
+        if sys.platform.startswith('linux'):
             logger.debug('getKernelStats: linux2')
             
             try:
@@ -48,7 +47,7 @@ class KernelStats(Collector):
                     lines.extend(stats.readlines())
                 with open('/proc/vmstat', 'r') as vmstat:
                     lines.extend(vmstat.readlines())
-            except IOError, e:
+            except IOError as e:
                 logger.error('getKernelStat: exception = %s', e)
                 return False
             
@@ -61,14 +60,14 @@ class KernelStats(Collector):
                 if len(elts) != 2:
                     continue
                 try:
-                    data[elts[0]] = long(elts[1])
+                    data[elts[0]] = int(elts[1])
                 except ValueError:  # not an int? skip this value
                     continue
             
             # Now loop through each interface
             by_sec_keys = ['ctxt', 'processes', 'pgfault', 'pgmajfault']
             to_add = {}
-            for (k, v) in data.iteritems():
+            for (k, v) in data.items():
                 if k in by_sec_keys:
                     if k in self.store:
                         to_add['%s/s' % k] = (v - self.store[k]) / diff
@@ -83,5 +82,5 @@ class KernelStats(Collector):
             return data
         
         else:
-            logger.debug('getKernelStats: other platform, returning')
+            self.set_not_eligible('This system is not managed')
             return False

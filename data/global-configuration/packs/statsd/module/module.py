@@ -15,24 +15,27 @@ from opsbro.threadmgr import threader
 from opsbro.module import ListenerModule
 from opsbro.stop import stopper
 from opsbro.ts import tsmgr
-from opsbro.parameters import StringParameter, BoolParameter, IntParameter
+from opsbro.parameters import StringParameter, IntParameter
 
 
 class StatsdModule(ListenerModule):
     implement = 'statsd'
     
     parameters = {
-        'enabled' : BoolParameter(default=False),
-        'port'    : IntParameter(default=8125),
-        'interval': IntParameter(default=10),
-        'address' : StringParameter(default='0.0.0.0'),
+        'enabled_if_group': StringParameter(default='statsd-listener'),
+        'port'            : IntParameter(default=8125),
+        'interval'        : IntParameter(default=10),
+        'address'         : StringParameter(default='0.0.0.0'),
     }
     
     
     def __init__(self):
         ListenerModule.__init__(self)
         self.statsd = None
+        
         self.enabled = False
+        self.enabled_if_group = 'statsd-listener'
+        
         self.port = 0
         self.udp_sock = None
         self.addr = '0.0.0.0'
@@ -50,33 +53,52 @@ class StatsdModule(ListenerModule):
         
         # Numpy lib is heavy, don't load it unless we really need it
         self.np = None
+        
+        # if we never got any metrics, we do a large wait for thread
+        # but as soon as we have one, go into small waits
+        self.did_have_metrics = False
     
     
-    # Prepare to open the UDP port
     def prepare(self):
         self.logger.debug('Statsd: prepare phase')
-        
-        self.enabled = self.get_parameter('enabled')
         self.statsd_port = self.get_parameter('port')
         self.stats_interval = self.get_parameter('interval')
         self.addr = self.get_parameter('address')
-        
-        if self.enabled:
-            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.logger.debug(self.udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
-            self.udp_sock.bind((self.addr, self.statsd_port))
-            self.logger.info("TS UDP port open", self.statsd_port)
-            self.logger.debug("UDP RCVBUF", self.udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
-            import numpy as np
-            self.np = np
-        else:
-            self.logger.info('STATSD is not enabled, skipping it')
+    
+    
+    # Prepare to open the UDP port
+    def __open_socket(self):
+        # We need the numpy
+        if self.np is None:
+            try:
+                import numpy as np
+                self.np = np
+            except ImportError:
+                self.logger.error('The numpy librairy is not installed')
+                self.np = None
+                return
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # UDP
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.logger.debug(self.udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+        self.udp_sock.bind((self.addr, self.statsd_port))
+        self.logger.info("TS UDP port open", self.statsd_port)
+        self.logger.debug("UDP RCVBUF", self.udp_sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+    
+    
+    def __close_socket(self):
+        if self.udp_sock:
+            self.udp_sock.close()
+        self.udp_sock = None
     
     
     def get_info(self):
-        return {'statsd_configuration': self.get_config(), 'statsd_info': None}
+        state = 'STARTED' if self.enabled else 'DISABLED'
+        log = ''
+        if self.enabled and self.np is None:
+            log = 'ERROR: cannot start the module: missing python-numpy package'
+            state = 'ERROR'
+        return {'configuration': self.get_config(), 'state': state, 'log': log}
     
     
     def launch(self):
@@ -87,12 +109,15 @@ class StatsdModule(ListenerModule):
     # The compute stats thread compute the STATSD values each X
     # seconds and push them into the classic TS part
     def launch_compute_stats_thread(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             now = time.time()
             if now > self.last_write + self.stats_interval:
                 self.compute_stats()
                 self.last_write = now
-            time.sleep(0.1)
+            if self.did_have_metrics:  # small wait
+                time.sleep(0.1)
+            else:
+                time.sleep(5)  # can wait a bit for the first run
     
     
     def compute_stats(self):
@@ -134,7 +159,7 @@ class StatsdModule(ListenerModule):
             self.timers = {}
         
         _t = time.time()
-        for (mname, timer) in timers.iteritems():
+        for (mname, timer) in timers.items():
             # We will need to compute the mean_99, count_99, upper_99, sum_99, sum_quares_99
             # but also std, upper, lower, count, count_ps, sum, sum_square, mean, median
             _t = time.time()
@@ -188,17 +213,26 @@ class StatsdModule(ListenerModule):
     # This is ht main STATSD UDP listener thread. Should not block and
     # be as fast as possible
     def launch_statsd_udp_listener(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
+            
+            if_group = self.get_parameter('enabled_if_group')
+            self.enabled = gossiper.is_in_group(if_group)
+            
+            # Ok, if we are not enabled, so not even talk to statsd
             if not self.enabled:
-                # Maybe we was enabled, and we are no more:
-                if self.udp_sock:
-                    self.udp_sock.close()
-                    self.udp_sock = None
+                self.__close_socket()
                 time.sleep(1)
                 continue
+            
             # maybe we were enabled, then not, then again, if so re-prepare
             if self.udp_sock is None:
-                self.prepare()
+                self.__open_socket()
+            
+            # Maybe we fuck on the socket or the numpy lib (maybe installation in progress)
+            if self.udp_sock is None:
+                self.logger.error('Seems that the socket or numpy are not realy, postpone the module initialiation')
+                time.sleep(1)
+                continue
             try:
                 data, addr = self.udp_sock.recvfrom(65535)  # buffer size is 1024 bytes
             except socket.timeout:  # loop until we got something
@@ -227,6 +261,9 @@ class StatsdModule(ListenerModule):
                 if len(_nvs) != 2:
                     continue
                 mname = _nvs[0].strip()
+                
+                # We have a ral value, so we will allow now smaller wait time
+                self.did_have_metrics = True
                 
                 # Two cases: it's for me or not
                 hkey = hashlib.sha1(mname).hexdigest()

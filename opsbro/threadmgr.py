@@ -1,4 +1,5 @@
 import threading
+
 try:
     import ctypes
 except ImportError:  # on python static build for example
@@ -6,12 +7,8 @@ except ImportError:  # on python static build for example
 import sys
 import os
 import time
-import traceback
-import cStringIO
-import json
-from opsbro.httpdaemon import http_export, response
-from opsbro.log import logger
-from opsbro.pubsub import pubsub
+from .library import libstore
+from .jsonmgr import jsoner
 
 # this part is doomed for windows portability, will be fun to manage :)
 try:
@@ -101,7 +98,11 @@ elif sys.platform.startswith("linux"):
         except ImportError:
             return
         import threading
-        libpthread_path = ctypes.util.find_library("pthread")
+        try:
+            libpthread_path = ctypes.util.find_library("pthread")
+        except RuntimeError:  # not found error on some system
+            return
+        # And some other returns None when not founded
         if not libpthread_path:
             return
         libpthread = ctypes.CDLL(libpthread_path)
@@ -142,16 +143,17 @@ elif sys.platform.startswith("linux"):
 
 # The f() wrapper
 def w(d, f, name, is_essential, args):
-    import cStringIO
     import traceback
     import time
-    from opsbro.log import logger
-    from opsbro.pubsub import pubsub
+    from opsbro.log import LoggerFactory, DEFAULT_LOG_PART
+    from opsbro.stop import stopper
+    
+    daemon_logger = LoggerFactory.create_logger(DEFAULT_LOG_PART)
     
     tid = 0
     if libc:
         tid = libc.syscall(186)  # get the threadid when you are in it :)
-    logger.debug('THREAD launch (%s) with thread id (%d)' % (name, tid))
+    daemon_logger.debug('THREAD launch (%s) with thread id (%d)' % (name, tid))
     # Set in our entry object
     d['tid'] = tid
     # Change the system name of the thread, if possible
@@ -159,23 +161,27 @@ def w(d, f, name, is_essential, args):
     try:
         f(*args)
     except Exception:
-        output = cStringIO.StringIO()
+        logger_crash = LoggerFactory.create_logger('crash')
+        StringIO = libstore.get_StringIO()
+        output = StringIO()
         traceback.print_exc(file=output)
-        logger.error("Thread %s is exiting on error. Back trace of this error: %s" % (name, output.getvalue()))
+        err = "Thread %s is exiting on error. Back trace of this error: %s" % (name, output.getvalue())
+        daemon_logger.error(err)
         output.close()
         
         if is_essential:
             # Maybe the thread WAS an essential one (like http thread or something like this), if so
             # catch it and close the whole daemon
-            logger.error('The thread %s was an essential one, we are stopping the daemon do not be in an invalid state' % name)
-            pubsub.pub('interrupt')
-            # Create a daemon thread with our wrapper function that will manage initial logging
+            logger_crash.error(err)
+            err = 'The thread %s was an essential one, we are stopping the daemon do not be in an invalid state' % name
+            logger_crash.error(err)
+            daemon_logger.error(err)
+            stopper.do_stop(err)
 
 
 class ThreadMgr(object):
     def __init__(self):
         self.all_threads = []
-        self.export_http()
     
     
     def check_alives(self):
@@ -208,9 +214,9 @@ class ThreadMgr(object):
         return t
     
     
-    # main method to export http interface. Must be in a method that got
-    # a self entry
+    # main method to export http interface. Must be in a method that got a self entry
     def export_http(self):
+        from .httpdaemon import http_export, response
         @http_export('/threads/', protected=True)
         @http_export('/threads', protected=True)
         def GET_threads():
@@ -221,7 +227,11 @@ class ThreadMgr(object):
             if psutil:
                 # NOTE: os.getpid() need by old psutil versions
                 our_process = psutil.Process(os.getpid())
-                our_threads = our_process.get_threads()
+                # Varies from psutil version
+                if hasattr(our_process, 'get_threads'):
+                    our_threads = our_process.get_threads()
+                else:  # new versions
+                    our_threads = our_process.threads()
                 for thr in our_threads:
                     t_id = thr.id
                     user_time = thr.user_time
@@ -236,10 +246,17 @@ class ThreadMgr(object):
             main_process = self.__get_thread_entry('Main Process', True, tid=os.getpid(), part='agent')  # our process, to allow to get user/system times
             res['process'] = main_process
             if our_process:
-                v = our_process.get_cpu_times()
+                if hasattr(our_process, 'get_cpu_times'):  # manage old/new versions
+                    v = our_process.get_cpu_times()
+                else:
+                    v = our_process.cpu_times()
                 main_process['user_time'] = v.user
                 main_process['system_time'] = v.system
-                res['age'] = time.time() - our_process.create_time
+                if callable(our_process.create_time):  # manage old/new versions
+                    create_time = our_process.create_time()
+                else:
+                    create_time = our_process.create_time
+                res['age'] = time.time() - create_time
             
             props = ['name', 'tid', 'essential', 'user_time', 'system_time', 'part']  # only copy jsonifiable objects
             for d in threads:
@@ -255,7 +272,7 @@ class ThreadMgr(object):
                 res['threads'].append(nd)
             # and also our process if possible
             
-            return json.dumps(res)
+            return jsoner.dumps(res)
 
 
 threader = ThreadMgr()

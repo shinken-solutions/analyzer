@@ -1,0 +1,20 @@
+FROM       naparuba/debian-9-python3
+MAINTAINER Jean Gabes <naparuba@gmail.com>
+
+ADD        test/docker-helper/  /
+
+# Set python3 as default python
+RUN        update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+
+ADD        . /root/opsbro-oss
+
+
+WORKDIR       /root/opsbro-oss
+
+RUN       python setup.py install
+
+# Copy the new checks
+ADD        test/test-files/test-internal-checks   /var/lib/opsbro/global-configuration/packs/
+
+ENTRYPOINT     test/test_feature_internal_checks.sh

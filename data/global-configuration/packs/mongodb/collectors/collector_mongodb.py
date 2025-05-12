@@ -1,8 +1,15 @@
 import traceback
-import urlparse
 import datetime
 import os
 import sys
+
+try:  # Python 2
+    from urlparse import urlparse
+except ImportError:  # python3
+    from urllib.parse import urlparse
+    
+    basestring = str
+from numbers import Number
 
 from opsbro.collector import Collector
 from opsbro.util import to_best_int_float
@@ -21,10 +28,35 @@ class Mongodb(Collector):
     def __init__(self):
         super(Mongodb, self).__init__()
         self.pymongo = None
+        self.mongoDBStore = None
+    
+    
+    def _clean_struct(self, e):
+        to_del = []
+        if isinstance(e, dict):
+            for (k, v) in e.items():
+                if isinstance(v, dict):
+                    self._clean_struct(v)
+                    continue
+                if isinstance(v, list) or isinstance(v, tuple):
+                    for sub_e in v:
+                        self._clean_struct(sub_e)
+                    continue
+                if not isinstance(v, Number) and not isinstance(v, basestring):
+                    self.logger.debug('CLEANING bad entry type: %s %s %s' % (k, v, type(v)))
+                    to_del.append(k)
+                    continue
+        for k in to_del:
+            del e[k]
+    
     
     def launch(self):
         logger = self.logger
         logger.debug('getMongoDBStatus: start')
+        
+        if not self.is_in_group('mongodb'):
+            self.set_not_eligible('Please add the mongodb group to enable this collector.')
+            return
         
         # Try to import pymongo from system (will be the best choice)
         # but if no available, switch to the embedded one
@@ -40,18 +72,18 @@ class Mongodb(Collector):
                 try:
                     import pymongo
                     self.pymongo = pymongo
-                except ImportError, exp:
-                    self.error('Unable to import pymongo library, even the embedded one (%s)' % exp)
+                except ImportError as exp:
+                    self.set_error('Unable to import pymongo library, even the embedded one (%s)' % exp)
                     return False
                 finally:
                     try:
                         sys.path.remove(my_dir)
                     except:
                         pass
-            
+        
         try:
             mongoURI = ''
-            parsed = urlparse.urlparse(self.get_parameter('uri'))
+            parsed = urlparse(self.get_parameter('uri'))
             
             # Can't use attributes on Python 2.4
             if parsed[0] != 'mongodb':
@@ -65,10 +97,13 @@ class Mongodb(Collector):
                 mongoURI = self.get_parameter('uri')
             
             logger.debug('-- mongoURI: %s', mongoURI)
-            conn = self.pymongo.Connection(mongoURI, slave_okay=True)
+            if hasattr(self.pymongo, 'Connection'):  # Old pymongo
+                conn = self.pymongo.Connection(mongoURI, slave_okay=True)
+            else:  # new pymongo (> 2.9.5)
+                conn = self.pymongo.MongoClient(mongoURI)
             logger.debug('Connected to MongoDB')
-        except self.pymongo.errors.ConnectionFailure, exp:
-            self.error('Unable to connect to MongoDB server %s - Exception = %s' % (mongoURI, exp))
+        except self.pymongo.errors.ConnectionFailure as exp:
+            self.set_error('Unable to connect to MongoDB server %s - Exception = %s' % (mongoURI, exp))
             return False
         
         # Older versions of pymongo did not support the command()
@@ -83,18 +118,14 @@ class Mongodb(Collector):
             
             # Setup            
             status = {'available': True}
+            self._clean_struct(statusOutput)  # remove objects type we do not want
             status.update(statusOutput)
-            # local time is a datetime, not possible to jsonify it
-            try:
-                del status['localTime']
-            except:
-                pass
             
             # Version
             try:
                 status['version'] = statusOutput['version']
                 logger.debug('getMongoDBStatus: version %s', statusOutput['version'])
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.error('getMongoDBStatus: version KeyError exception = %s', ex)
                 pass
             
@@ -110,7 +141,7 @@ class Mongodb(Collector):
                 status['globalLock']['currentQueue']['readers'] = statusOutput['globalLock']['currentQueue']['readers']
                 status['globalLock']['currentQueue']['writers'] = statusOutput['globalLock']['currentQueue']['writers']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: globalLock KeyError exception = %s' % ex)
                 pass
             
@@ -123,7 +154,7 @@ class Mongodb(Collector):
                 status['mem']['virtual'] = statusOutput['mem']['virtual']
                 status['mem']['mapped'] = statusOutput['mem']['mapped']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: memory KeyError exception = %s', ex)
                 pass
             
@@ -135,7 +166,7 @@ class Mongodb(Collector):
                 status['connections']['current'] = statusOutput['connections']['current']
                 status['connections']['available'] = statusOutput['connections']['available']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: connections KeyError exception = %s', ex)
                 pass
             
@@ -147,7 +178,7 @@ class Mongodb(Collector):
                 status['extraInfo']['heapUsage'] = statusOutput['extra_info']['heap_usage_bytes']
                 status['extraInfo']['pageFaults'] = statusOutput['extra_info']['page_faults']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: extra info KeyError exception = %s', ex)
                 pass
             
@@ -161,13 +192,13 @@ class Mongodb(Collector):
                 status['backgroundFlushing']['lastFlushLength'] = statusOutput['backgroundFlushing']['last_ms']
                 status['backgroundFlushing']['flushLengthAvrg'] = statusOutput['backgroundFlushing']['average_ms']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: backgroundFlushing KeyError exception = %s', ex)
                 pass
             
             # Per second metric calculations (opcounts and asserts)
             try:
-                if self.mongoDBStore == None:
+                if self.mongoDBStore is None:
                     logger.debug('getMongoDBStatus: per second metrics no cached data, so storing for first time')
                     self.setMongoDBStore(statusOutput)
                 
@@ -223,7 +254,7 @@ class Mongodb(Collector):
                             'getMongoDBStatus: per second metrics negative value calculated, mongod likely restarted, so clearing cache')
                         self.setMongoDBStore(statusOutput)
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: per second metrics KeyError exception = %s' % ex)
                 pass
             
@@ -234,7 +265,7 @@ class Mongodb(Collector):
                 status['cursors'] = {}
                 status['cursors']['totalOpen'] = statusOutput['cursors']['totalOpen']
             
-            except KeyError, ex:
+            except KeyError as ex:
                 logger.debug('getMongoDBStatus: cursors KeyError exception = %s' % ex)
                 pass
             
@@ -279,7 +310,7 @@ class Mongodb(Collector):
                     if 'optimeDate' in member:  # Only available as of 1.7.2
                         deltaOptime = datetime.datetime.utcnow() - member['optimeDate']
                         status['replSet']['members'][str(member['_id'])]['optimeDate'] = (deltaOptime.microseconds + (
-                            deltaOptime.seconds + deltaOptime.days * 24 * 3600) * 10 ** 6) / 10 ** 6
+                                deltaOptime.seconds + deltaOptime.days * 24 * 3600) * 10 ** 6) / 10 ** 6
                     
                     if 'self' in member:
                         status['replSet']['myId'] = member['_id']
@@ -289,7 +320,7 @@ class Mongodb(Collector):
                         if 'lastHeartbeat' in member:
                             deltaHeartbeat = datetime.datetime.utcnow() - member['lastHeartbeat']
                             status['replSet']['members'][str(member['_id'])]['lastHeartbeat'] = (
-                                                                                                    deltaHeartbeat.microseconds + (
+                                                                                                        deltaHeartbeat.microseconds + (
                                                                                                         deltaHeartbeat.seconds + deltaHeartbeat.days * 24 * 3600) * 10 ** 6) / 10 ** 6
                     
                     if 'errmsg' in member:
@@ -312,7 +343,7 @@ class Mongodb(Collector):
                         if v is not None:
                             status['dbStats'][database][key] = v
         
-        except Exception, ex:
+        except Exception:
             logger.error('Unable to get MongoDB status - Exception = %s', traceback.format_exc())
             return False
         

@@ -100,7 +100,7 @@ class LolCat(object):
         # if options.force or self.output.isatty():
         s = STRIP_ANSI.sub('', s)
         r = ''
-        if isinstance(s, str):
+        if isinstance(s, str) and not PY3:  # str are alrady utf8 in python3
             s = s.decode('utf-8', 'replace')
 
         # We must consider the classic CMD as a no tty, as it's just too limited
@@ -110,7 +110,7 @@ class LolCat(object):
             
         for i, c in enumerate(s):
             rgb = self.rainbow(0.1, offset + i / spread)
-            if isinstance(c, str):
+            if isinstance(c, str) and not PY3:
                 c = c.encode('utf-8', 'replace')
             r += u''.join([self.wrap(self.ansi(rgb)), c if PY3 else c, ])
         r += '\x1b[0m'

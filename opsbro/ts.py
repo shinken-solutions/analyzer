@@ -2,23 +2,25 @@ import os
 import time
 import threading
 import base64
-import cPickle
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 import json
 
-from opsbro.stats import STATS
-from opsbro.log import LoggerFactory
-from opsbro.threadmgr import threader
-from opsbro.now import NOW
-from opsbro.dbwrapper import dbwrapper
-from opsbro.gossip import gossiper
-from opsbro.stop import stopper
-from opsbro.kv import kvmgr
-from opsbro.httpdaemon import http_export, response
+from .stats import STATS
+from .log import LoggerFactory
+from .threadmgr import threader
+from .now import NOW
+from .dbwrapper import dbwrapper
+from .stop import stopper
+from .kv import kvmgr
 
 # DO NOT FORGEET:
 # sysctl -w net.core.rmem_max=26214400
 
-SERIALIZER = cPickle
+SERIALIZER = pickle
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('time-series')
@@ -60,7 +62,9 @@ class TSBackend(object):
             self.db.Put(key, '')
             logger.debug('TS propagating a new key', key)
             # now propagate the key to the other ts nodes
-            gossiper.stack_new_ts_broadcast(key)
+            # TODO: get back /ts/new broadcast messages, but beware of overload the
+            # gossip links with too much messages
+            # gossiper.stack_new_ts_broadcast(key)
         return False
     
     
@@ -165,7 +169,6 @@ class TSBackend(object):
         # self.its.assume_key(key, cur_min)
         # STATS.incr('its-assume-key', time.time() - _t)
         
-        
         ### Hour now
         # Now look at if we just switch hour
         hour = divmod(cur_min, 3600)[0] * 3600
@@ -211,7 +214,7 @@ class TSBackend(object):
             hour_e['nb'] += 1
             hour_e['sum'] += e['avg']
             # We try to look at which minute we are in the hour object
-            minute_hour_idx = (cur_min - hour) / 60
+            minute_hour_idx = (cur_min - hour) // 60
             hour_e['values'][minute_hour_idx] = e['avg']
             hour_e['avg'] = hour_e['sum'] / float(hour_e['nb'])
         STATS.incr('hour-compute', time.time() - _t)
@@ -254,7 +257,7 @@ class TSBackend(object):
             day_e['nb'] += 1
             day_e['sum'] += e['avg']
             # We try to look at which minute we are in the day object
-            minute_day_idx = (cur_min - day) / 60
+            minute_day_idx = (cur_min - day) // 60
             day_e['values'][minute_day_idx] = e['avg']
             day_e['avg'] = day_e['sum'] / float(day_e['nb'])
         STATS.incr('day-compute', time.time() - _t)
@@ -269,11 +272,11 @@ class TSBackend(object):
     
     
     def do_reaper_thread(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             now = NOW.now
             
             with self.data_lock:
-                all_names = self.data.keys()
+                all_names = list(self.data.keys())  # python3: be sure to have a copy
             logger.debug("DOING reaper thread on %d elements" % len(all_names))
             for name in all_names:
                 # Grok all minute entries
@@ -302,6 +305,8 @@ class TSBackend(object):
     
     # Export end points to get/list TimeSeries
     def export_http(self):
+        from .httpdaemon import http_export, response
+        
         @http_export('/list/')
         @http_export('/list/:key')
         def get_ts_keys(key=''):

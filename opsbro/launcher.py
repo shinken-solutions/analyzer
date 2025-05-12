@@ -1,19 +1,19 @@
 import os
 import sys
-import signal
-import locale
 
-# On unix, try to raise system resources to the max (unlimited if possible)
-try:
-    import resource
-except ImportError:
-    resource = None
-
-from opsbro.cluster import Cluster
-from opsbro.log import logger
-
+from .log import logger
+from .configurationmanager import configmgr
 
 REDIRECT_TO = getattr(os, "devnull", "/dev/null")
+
+
+def get_resource_lib():
+    # On unix, try to raise system resources to the max (unlimited if possible)
+    try:
+        import resource
+    except ImportError:
+        resource = None
+    return resource
 
 
 # Main class for launching the daemon
@@ -25,6 +25,7 @@ class Launcher(object):
         
         # on windows, skip locale globaly
         if os.name == 'nt':
+            import locale
             locale.setlocale(locale.LC_ALL, 'C')
     
     
@@ -32,7 +33,7 @@ class Launcher(object):
         if os.path.exists('/tmp'):
             try:
                 os.chdir('/tmp')
-            except Exception, e:
+            except Exception as e:
                 raise Exception('Invalid working directory /tmp')
     
     
@@ -40,7 +41,7 @@ class Launcher(object):
         logger.info("Unlinking lock file %s" % self.lock_path)
         try:
             os.unlink(self.lock_path)
-        except Exception, e:
+        except Exception as e:
             logger.error("Got an error unlinking our pidfile: %s" % (e))
     
     
@@ -102,6 +103,7 @@ class Launcher(object):
     # Go in "daemon" mode: redirect stdout/err,
     # chdir, umask, fork-setsid-fork-writepid
     def __daemonize(self):
+        import signal
         logger.debug("Redirecting stdout and stderr as necessary..")
         if self.debug_path:
             fdtemp = os.open(self.debug_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
@@ -111,13 +113,25 @@ class Launcher(object):
         os.dup2(fdtemp, 1)  # standard output (1)
         os.dup2(fdtemp, 2)  # standard error (2)
         
+        # We do not need stdin any more, and more important, we should NOT
+        # have it because cherrypy will try to select/read it if available
+        # We do not need stdin any more, close it to do not polute caller shell
+        try:
+            os.close(0)
+        except OSError:  # was not open
+            pass
+        # but IMPORTANT: if we just close it, the next open() will take the 0 file
+        # descriptor, and then cherrypy will try to read it! So fake open it
+        # with a dummy file, we will never use it, but it take the file descriptor 0
+        zero_fd = os.open(REDIRECT_TO, os.O_RDWR)
+        
         # Now the fork/setsid/fork..
         try:
             pid = os.fork()
-        except OSError, e:
+        except OSError as e:
             s = "%s [%d]" % (e.strerror, e.errno)
             logger.error(s)
-            raise Exception, s
+            raise Exception(s)
         
         if pid != 0:
             # In the father: we check if our child exit correctly
@@ -143,8 +157,8 @@ class Launcher(object):
         os.setsid()
         try:
             pid = os.fork()
-        except OSError, e:
-            raise Exception, "%s [%d]" % (e.strerror, e.errno)
+        except OSError as e:
+            raise Exception("%s [%d]" % (e.strerror, e.errno))
         if pid != 0:
             # we are the last step and the real daemon is actually correctly created at least.
             # we have still the last responsibility to write the pid of the daemon itself.
@@ -158,6 +172,8 @@ class Launcher(object):
     
     
     def __find_and_set_higer_system_limit(self, res, res_name):
+        resource = get_resource_lib()
+        
         # first try to get the system limit, if already unlimited (-1) then we are good :)
         soft, hard = resource.getrlimit(res)
         if soft == -1 and hard == -1:
@@ -189,6 +205,7 @@ class Launcher(object):
     
     
     def __find_and_set_higer_system_limits(self):
+        resource = get_resource_lib()
         if not resource:
             logger.info('System resource package is not available, cannot increase system limits')
             return
@@ -196,7 +213,7 @@ class Launcher(object):
             self.__find_and_set_higer_system_limit(res, res_name)
     
     
-    def do_daemon_init_and_start(self, is_daemon=False):
+    def do_daemon_init_and_start(self, is_daemon=False, one_shot=False, force_wait_proxy=False, before_start_callback=None):
         self.__change_to_workdir()
         self.__check_parallel_run()
         
@@ -214,11 +231,20 @@ class Launcher(object):
         
         # Now we are started, try to raise system limits to the maximum allowed
         self.__find_and_set_higer_system_limits()
-    
-    
-    # Main locking function, will LOCK here until the daemon is dead/killed/whatever
-    def main(self, one_shot=False):
+        
+        # Windows call have a special thread to start, but on the final process only
+        if before_start_callback is not None:
+            before_start_callback()
+        
+        # Main locking function, will LOCK here until the daemon is dead/killed/whatever
+        from .cluster import Cluster  # lazy load, it's a huge one
         c = Cluster(cfg_dir=self.cfg_dir)
         
         # Blocking function here
-        c.main(one_shot=one_shot)
+        c.main(one_shot=one_shot, force_wait_proxy=force_wait_proxy)
+    
+    
+    # To boost CLI we did not loaded all configuration and objects
+    # so now we need to launch the agent, we must to it now
+    def finish_to_load_configuration_and_objects(self):
+        configmgr.finish_to_load_configuration_and_objects()

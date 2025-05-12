@@ -3,8 +3,8 @@ import sys
 import imp
 import traceback
 
-from opsbro.log import logger
-from opsbro.module import Module
+from .log import logger
+from .module import Module
 
 
 class ModuleManager(object):
@@ -114,6 +114,7 @@ class ModuleManager(object):
         r = {}
         for mod in self.modules:
             mod_info = mod.get_info()
+            mod_info['module_type'] = mod.module_type
             r[mod.implement] = mod_info
         return r
     

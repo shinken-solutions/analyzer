@@ -5,6 +5,10 @@ import os
 import time
 from string import digits
 
+PY3 = sys.version_info >= (3,)
+if PY3:
+    basestring = str
+
 from opsbro.collector import Collector
 from opsbro.now import NOW
 
@@ -72,13 +76,13 @@ class IoStats(Collector):
     
     def compute_linux_disk_stats(self, new_raw_stats, diff_time):
         r = {}
-        for (device, new_stats) in new_raw_stats.iteritems():
+        for (device, new_stats) in new_raw_stats.items():
             old_stats = self.previous_raw.get(device, None)
             # A new disk did spawn? wait a loop to compute it
             if old_stats is None:
                 continue
             r[device] = {}
-            for (k, new_v) in new_stats.iteritems():
+            for (k, new_v) in new_stats.items():
                 old_v = old_stats[k]
                 
                 # String= device name, but we already have it in the key path
@@ -124,8 +128,8 @@ class IoStats(Collector):
                 iostats[_label] = v
             return iostats
         
-        if sys.platform != 'linux2':
-            logger.debug('getIOStats: unsupported platform')
+        if not sys.platform.startswith('linux'):  # linux2 on python2, linux on python3
+            self.set_not_eligible('Unsupported platform (%s) for this collector' % sys.platform)
             return False
         
         new_stats = self._get_disk_stats()

@@ -6,19 +6,25 @@ import threading
 import glob
 import imp
 import copy
+import json
 
-from opsbro.log import LoggerFactory
-from opsbro.threadmgr import threader
-from opsbro.stop import stopper
-from opsbro.httpdaemon import http_export, response
-from opsbro.collector import Collector
-from jsonmgr import jsoner
-from opsbro.now import NOW
-from opsbro.ts import tsmgr
-from opsbro.gossip import gossiper
+from .log import LoggerFactory
+from .threadmgr import threader
+from .stop import stopper
+from .collector import Collector
+from .jsonmgr import jsoner
+from .now import NOW
+from .ts import tsmgr
+from .gossip import gossiper
+from .basemanager import BaseManager
+from .topic import topiker, TOPIC_METROLOGY
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('collector')
+
+# Common rule for printing the COLLECTORS for the outside world
+COLLECTORS_STATE_COLORS = {'OK': 'green', 'ERROR': 'red', 'NOT-ELIGIBLE': 'grey', 'RUNNING': 'grey', 'PENDING': 'grey'}
+COLLECTORS_STATES = ['PENDING', 'OK', 'NOT-ELIGIBLE', 'RUNNING', 'ERROR']
 
 
 def get_collectors(self):
@@ -30,15 +36,19 @@ def get_collectors(self):
         fname = os.path.splitext(os.path.basename(f))[0]
         try:
             imp.load_source('collector%s' % fname, f)
-        except Exception, exp:
+        except Exception as exp:
             logger.error('Cannot load collector %s: %s' % (fname, exp))
             continue
     
     self.load_all_collectors()
 
 
-class CollectorManager:
+class CollectorManager(BaseManager):
+    history_directory_suffix = 'collector'
+    
+    
     def __init__(self):
+        super(CollectorManager, self).__init__()
         self.collectors = {}
         
         self.did_run = False  # did our data are all ok or we did not launch all?
@@ -46,6 +56,10 @@ class CollectorManager:
         # results from the collectors, keep ony the last run
         self.results_lock = threading.RLock()
         self.results = {}
+        
+        self.logger = logger
+        
+        self.cur_launchs = {}
     
     
     def load_directory(self, directory, pack_name='', pack_level=''):
@@ -60,7 +74,7 @@ class CollectorManager:
                 # another way to give the information to the inner class inside, I take it ^^
                 m = imp.load_source('collector___%s___%s___%s' % (pack_level, pack_name, fname), f)
                 logger.debug('Collector module loaded: %s' % m)
-            except Exception, exp:
+            except Exception as exp:
                 logger.error('Cannot load collector %s: %s' % (fname, exp))
     
     
@@ -89,7 +103,7 @@ class CollectorManager:
         try:
             # also give it our put result callback
             inst = cls()
-        except Exception, exp:
+        except Exception as exp:
             logger.error('Cannot load the %s collector: %s' % (cls, traceback.format_exc()))
             return
         
@@ -108,7 +122,7 @@ class CollectorManager:
     
     # Now we hae our collectors and our parameters, link both
     def get_parameters_from_packs(self):
-        for (cname, e) in self.collectors.iteritems():
+        for (cname, e) in self.collectors.items():
             e['inst'].get_parameters_from_pack()
     
     
@@ -119,8 +133,8 @@ class CollectorManager:
     def get_info(self):
         res = {}
         with self.results_lock:
-            for (cname, e) in self.collectors.iteritems():
-                d = {'name': e['name'], 'active': e['active'], 'log': e['log']}
+            for (cname, e) in self.collectors.items():
+                d = {'name': e['name'], 'state': e['inst'].state, 'log': e['inst'].log}
                 res[cname] = d
         return res
     
@@ -128,28 +142,33 @@ class CollectorManager:
     def get_retention(self):
         res = {}
         with self.results_lock:
-            for (cname, e) in self.collectors.iteritems():
+            for (cname, e) in self.collectors.items():
                 res[cname] = {}
                 res[cname]['results'] = e['results']
                 res[cname]['metrics'] = e['metrics']
+                res[cname]['state'] = e['inst'].state
+                res[cname]['old_state'] = e['inst'].old_state
         return res
     
     
     def load_retention(self, data):
         with self.results_lock:
-            for (cname, e) in data.iteritems():
+            for (cname, e) in data.items():
                 # maybe this collectr is missing now
                 if cname not in self.collectors:
                     continue
+                inst = self.collectors[cname]['inst']
                 self.collectors[cname]['results'] = e['results']
                 self.collectors[cname]['metrics'] = e['metrics']
+                inst.state = e.get('state', 'PENDING')
+                inst.old_state = e.get('old_state', 'PENDING')
     
     
     def get_data(self, s):
         elts = s.split('.')
         d = {}
         # construct will all results of our collectors
-        for (k, v) in self.collectors.iteritems():
+        for (k, v) in self.collectors.items():
             d[k] = v['results']
         
         for k in elts:
@@ -187,41 +206,54 @@ class CollectorManager:
                 tsmgr.tsb.add_value(timestamp, key, value, local=True)
     
     
+    def _launch_collectors(self):
+        now = int(time.time())
+        for (colname, e) in self.collectors.items():
+            colname = e['name']
+            inst = e['inst']
+            # maybe a collection is already running
+            if colname in self.cur_launchs:
+                continue
+            if now >= e['next_check']:
+                logger.debug('COLLECTOR: launching collector %s' % colname)
+                t = threader.create_and_launch(inst.main, name='collector-%s' % colname, part='collector')
+                self.cur_launchs[colname] = t
+                e['next_check'] += 10
+                e['last_check'] = now
+        
+        to_del = []
+        for (colname, t) in self.cur_launchs.items():
+            # if the thread is finish, join it
+            # NOTE: but also wait for all first execution to finish
+            if not t.is_alive() or not self.did_run:
+                logger.debug('Joining collector thread: %s' % colname)
+                t.join()
+                to_del.append(colname)
+        for colname in to_del:
+            del self.cur_launchs[colname]
+    
+    
     # Main thread for launching collectors
     def do_collector_thread(self):
         logger.log('COLLECTOR thread launched')
-        cur_launchs = {}
-        while not stopper.interrupted:
-            now = int(time.time())
-            for (colname, e) in self.collectors.iteritems():
-                colname = e['name']
-                inst = e['inst']
-                # maybe a collection is already running
-                if colname in cur_launchs:
-                    continue
-                if now >= e['next_check']:
-                    logger.debug('COLLECTOR: launching collector %s' % colname)
-                    t = threader.create_and_launch(inst.main, name='collector-%s' % colname, part='collector')
-                    cur_launchs[colname] = t
-                    e['next_check'] += 10
-                    e['last_check'] = now
+        # Before run, be sure we have a history directory ready
+        self.prepare_history_directory()
+        while not stopper.is_stop():
+            # Only launch if we are allowed
+            if topiker.is_topic_enabled(TOPIC_METROLOGY):
+                self._launch_collectors()
             
-            to_del = []
-            for (colname, t) in cur_launchs.iteritems():
-                # if the thread is finish, join it
-                # NOTE: but also wait for all first execution to finish
-                if not t.is_alive() or not self.did_run:
-                    logger.debug('Joining collector thread: %s' % colname)
-                    t.join()
-                    to_del.append(colname)
-            for colname in to_del:
-                del cur_launchs[colname]
             self.did_run = True  # ok our data are filled, you can use this data
+            # Each loop we save our history data (collector state changed)
+            self.write_history_entry()
             time.sleep(1)
     
     
     def get_collector_json_extract(self, entry):
         c = copy.copy(entry)
+        inst = c['inst']
+        c['state'] = inst.state
+        c['log'] = inst.log
         # inst are not serializable
         del c['inst']
         return (c['name'], c)
@@ -230,6 +262,7 @@ class CollectorManager:
     # main method to export http interface. Must be in a method that got
     # a self entry
     def export_http(self):
+        from .httpdaemon import http_export, response
         
         @http_export('/collectors/')
         @http_export('/collectors')
@@ -237,7 +270,7 @@ class CollectorManager:
         def GET_collectors():
             response.content_type = 'application/json'
             res = {}
-            for (ccls, e) in self.collectors.iteritems():
+            for (ccls, e) in self.collectors.items():
                 cname, c = self.get_collector_json_extract(e)
                 res[cname] = c
             return jsoner.dumps(res)
@@ -251,6 +284,13 @@ class CollectorManager:
                 return jsoner.dumps(e)
             cname, c = self.get_collector_json_extract(e)
             return jsoner.dumps(c)
+        
+        
+        @http_export('/agent/collectors/history', method='GET')
+        def get_collectors_history():
+            response.content_type = 'application/json'
+            r = self.get_history()
+            return json.dumps(r)
 
 
 collectormgr = CollectorManager()

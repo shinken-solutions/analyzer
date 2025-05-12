@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-
+from __future__ import print_function
 import os
-import json
 import imp
 import traceback
 import sys
@@ -10,26 +9,30 @@ import time
 import itertools
 import subprocess
 
-from opsbro.configurationmanager import configmgr
-from opsbro.collectormanager import collectormgr
-from opsbro.modulemanager import modulemanager
-from opsbro.packer import packer
-from opsbro.unixclient import get_json, get_local, get_request_errors
-from opsbro.httpclient import httper
-from opsbro.log import cprint, logger
-from opsbro.defaultpaths import DEFAULT_LOG_DIR, DEFAULT_CFG_DIR, DEFAULT_DATA_DIR, DEFAULT_SOCK_PATH
-from opsbro.info import VERSION
-from opsbro.cli_display import print_h1
-from opsbro.topic import topiker
-from opsbro.characters import CHARACTERS
-from opsbro.misc.lolcat import lolcat
-from opsbro.cluster import AGENT_STATE_STOPPED
-from opsbro.now import NOW
+PY3 = (sys.version_info[0] == 3)
+if PY3:
+    xrange = range  # note: python 3 do not have xrange
+
+from .configurationmanager import configmgr
+from .packer import packer, PACKS_LEVELS
+from .unixclient import get_json, get_local, get_request_errors
+from .httpclient import httper
+from .log import cprint, logger, sprintf, is_tty
+from .defaultpaths import DEFAULT_LOG_DIR, DEFAULT_CFG_DIR, DEFAULT_DATA_DIR, DEFAULT_SOCK_PATH
+from .info import VERSION
+from .cli_display import print_h1, get_terminal_size
+from .topic import topiker
+from .characters import CHARACTERS
+from .misc.lolcat import lolcat
+from .agentstates import AGENT_STATES
+from .now import NOW
+from .jsonmgr import jsoner
 
 # Will be populated by the opsbro CLI command
 CONFIG = None
 
 CURRENT_BINARY = ''
+DEFAULT_INFO_COL_SIZE = 22
 
 
 # We should save the current opsbro binary used, for debug purpose for example
@@ -48,9 +51,9 @@ def get_local_socket():
 
 
 if os.name != 'nt':
-    def get_opsbro_json(uri):
+    def get_opsbro_json(uri, timeout=10):
         local_socket = get_local_socket()
-        return get_json(uri, local_socket)
+        return get_json(uri, local_socket, timeout=timeout)
     
     
     def get_opsbro_local(uri):
@@ -58,21 +61,29 @@ if os.name != 'nt':
         return get_local(uri, local_socket)
     
     
-    def post_opsbro_json(uri, data):
+    def post_opsbro_json(uri, data, timeout=10):
         local_socket = get_local_socket()
-        return get_json(uri, local_socket, params=data, method='POST')
+        return get_json(uri, local_socket, params=data, method='POST', timeout=timeout)
     
     
     def put_opsbro_json(uri, data):
         local_socket = get_local_socket()
         return get_json(uri, local_socket, params=data, method='PUT')
+    
+    
+    def delete_opsbro_json(uri):
+        local_socket = get_local_socket()
+        return get_json(uri, local_socket, method='DELETE')
+
+
 else:
-    def get_opsbro_json(uri):
+    def get_opsbro_json(uri, timeout=10):
         r = httper.get('http://127.0.0.1:6770%s' % uri)
-        obj = json.loads(r)
+        obj = jsoner.loads(r)
         return obj
     
-    #TODO: catch the real status code?
+    
+    # TODO: catch the real status code?
     def get_opsbro_local(uri):
         r = httper.get('http://127.0.0.1:6770%s' % uri)
         status = 200  # if not, should have send an exception
@@ -80,12 +91,16 @@ else:
         return (status, text)
     
     
-    def post_opsbro_json(uri, data):
+    def post_opsbro_json(uri, data, timeout=10):
         return get_json(uri, params=data, method='POST')
     
     
     def put_opsbro_json(uri, data):
         return get_json(uri, params=data, method='PUT')
+    
+    
+    def delete_opsbro_json(uri):
+        return get_json(uri, method='DELETE')
 
 
 def get_opsbro_agent_state():
@@ -96,49 +111,64 @@ def get_opsbro_agent_state():
     return agent_state
 
 
+class NoContextClass(object):
+    def __enter__(self):
+        pass
+    
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 class AnyAgent(object):
     def __init__(self):
         self.did_start_a_tmp_agent = False
         self.tmp_agent = None
-
-
+    
+    
     def __enter__(self):
         self.assert_one_agent()
     
-
-    def _do_agent_stop(self                      ):
+    
+    def _do_agent_stop(self):
         try:
             get_opsbro_local('/stop')
-        except get_request_errors(), exp:
+        except get_request_errors() as exp:
             logger.error(exp)
             return
+        agent_state = wait_for_agent_stopped()
+        if agent_state != AGENT_STATES.AGENT_STATE_STOPPED:
+            logger.error('The temporary agent did not stopped in a valid time. Currently: %s' % agent_state)
+            return
+    
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.tmp_agent is not None:
-            cprint('# * Stopping the temporary agent:', color= 'grey', end='')
+            cprint('')
+            cprint('%s Stopping the temporary agent:' % CHARACTERS.corner_top_left, color='grey', end='')
             sys.stdout.flush()
             self._do_agent_stop()
             # Be sure to kill it
             self.tmp_agent.terminate()
             cprint('%s OK' % CHARACTERS.check, color='grey')
-            cprint('# | if you want to start the agent can launch it with the "opsbro agent start" command', color='grey')
-
-
+            cprint('%s | if you want to start the agent: launch it with the "opsbro agent start" command' % CHARACTERS.corner_bottom_left, color='grey')
+    
+    
     @staticmethod
     def __tmp_agent_entering():
         os.setsid()
         try:
             from setproctitle import setproctitle
             setproctitle("Temporary agent")
-        except:
+        except ImportError:
             pass
-
-
+    
+    
     # For some CLI we don't care if we have a running agent or just a dummy send (like
     # quick dashboards)
     def assert_one_agent(self):
         agent_state = wait_for_agent_started(visual_wait=True)
-        if agent_state == AGENT_STATE_STOPPED:
+        if agent_state == AGENT_STATES.AGENT_STATE_STOPPED:
             self.did_start_a_tmp_agent = True
             tmp_agent_cmd = 'python %s agent start' % get_current_binary()
             logger.debug('Temporary agent command: %s' % tmp_agent_cmd)
@@ -148,16 +178,41 @@ class AnyAgent(object):
                 additional_args['close_fds'] = True
             self.tmp_agent = subprocess.Popen(tmp_agent_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **additional_args)
             cprint('')
-            cprint('# This command need a started agent, and currently no one is started', color='grey')
-            cprint('# * Spawning a ', color='grey', end='')
+            cprint('%s This command need a started agent, and currently no one is started' % CHARACTERS.corner_top_left, color='grey')
+            cprint('%s | Spawning a ' % CHARACTERS.vbar, color='grey', end='')
             cprint('temporary one', color='yellow')
-            cprint('# | - process pid is %s' % self.tmp_agent.pid, color='grey')
-            cprint('# | - you can avoid the temporary agent by launching one with "opsbro agent start" or "/etc/init.d/opsbro start" ', color='grey')
+            cprint('%s | - process pid is %s' % (CHARACTERS.vbar, self.tmp_agent.pid), color='grey')
+            cprint('%s | - you can avoid the temporary agent by launching one with "opsbro agent start" or "/etc/init.d/opsbro start" ' % CHARACTERS.corner_bottom_left, color='grey')
+            cprint('')
             agent_state = wait_for_agent_started(visual_wait=True, wait_for_spawn=True)  # note: we wait for spawn as it can take some few seconds before the unix socket is available
-        if agent_state == AGENT_STATE_STOPPED:
+        if agent_state == AGENT_STATES.AGENT_STATE_STOPPED:
             raise Exception('Cannot have the agent, even a temporary one')
-        
-        
+
+
+def wait_for_agent_stopped(timeout=5, visual_wait=False):
+    spinners = itertools.cycle(CHARACTERS.spinners)
+    start = NOW.monotonic()  # note: thanks to monotonic, we don't care about the system get back in time during this loop
+    agent_state = 'unknown'
+    while NOW.monotonic() - start < timeout:
+        try:
+            agent_state = get_opsbro_json('/agent/state')
+        except get_request_errors():
+            return 'stopped'
+        if visual_wait:
+            cprint('\r %s ' % next(spinners), color='blue', end='')  # note: spinners.next() do not exists in python3
+            cprint(' agent is still ', end='')
+            cprint('stopping', color='yellow', end='')
+            sys.stdout.flush()
+        time.sleep(0.1)
+    if visual_wait:
+        # Clean what we did put before
+        cprint('\r', end='')
+        cprint(' ' * 100, end='')
+        cprint('\r', end='')
+        sys.stdout.flush()
+    return agent_state
+
+
 # Maybe the agent is initializing or not even started (as unix socket).
 # Timeout: wait as much time
 # visual_wait: during the wait, we can show a spinner and a text to enjoy the user
@@ -184,7 +239,7 @@ def wait_for_agent_started(timeout=30, visual_wait=False, exit_if_stopped=False,
         if agent_state == 'ok':
             break
         if visual_wait:
-            cprint('\r %s ' % spinners.next(), color='blue', end='')
+            cprint('\r %s ' % next(spinners), color='blue', end='')  # note: spinners.next() do not exists in python3
             cprint(' agent is still ', end='')
             cprint('initializing', color='yellow', end='')
             cprint(' (collector, detector,... are not finish)', end='')
@@ -203,7 +258,7 @@ def print_info_title(title):
     print_h1(title)
 
 
-def print_2tab(e, capitalize=True, col_size=20):
+def print_2tab(e, capitalize=True, col_size=DEFAULT_INFO_COL_SIZE):
     for (k, v) in e:
         label = k
         if capitalize:
@@ -214,7 +269,6 @@ def print_2tab(e, capitalize=True, col_size=20):
         # If it's a dict, we got additionnal data like color or type
         if isinstance(v, dict):
             color = v.get('color', 'green')
-            _type = v.get('type', 'std')
             value = v.get('value')
             cprint(value, color=color)
         else:
@@ -227,11 +281,13 @@ class Dummy():
 
 
 class CLIEntry(object):
-    def __init__(self, f, args, description, topic):
+    def __init__(self, f, args, description, allow_temporary_agent, topic, need_full_configuration):
         self.f = f
         self.args = args
         self.description = description
+        self.allow_temporary_agent = allow_temporary_agent
         self.topic = topic
+        self.need_full_configuration = need_full_configuration
 
 
 # Commander is the main class for managing the CLI session and behavior
@@ -253,8 +309,11 @@ class CLICommander(object):
             logger.error('Configuration directory [%s] is missing' % cfg_dir)
             sys.exit(2)
         
+        t0 = time.time()
+        
         # We need the main cfg_directory
-        configmgr.load_cfg_dir(cfg_dir, load_focus='agent')
+        configmgr.load_main_cfg_dir(cfg_dir)
+        logger.debug('configmgr.load_cfg_dir (agent) :: %.3f' % (time.time() - t0))
         
         data_dir = os.path.abspath(os.path.join(DEFAULT_DATA_DIR))  # '/var/lib/opsbro/'
         
@@ -263,36 +322,20 @@ class CLICommander(object):
             os.mkdir(data_dir)
         
         # Then we will need to look at other directories, list from
+        # * core-configuration = fill by installation, read-only
         # * global-configration = common to all nodes
         # * zone-configuration = common to zone nodes
         # * local-configuration = on this specific node
-        global_configuration = os.path.join(data_dir, 'global-configuration')
-        zone_configuration = os.path.join(data_dir, 'zone-configuration')
-        local_configuration = os.path.join(data_dir, 'local-configuration')
+        for configuration_level in PACKS_LEVELS:
+            path = os.path.join(data_dir, '%s-configuration' % configuration_level)
+            # Ask the packer to load pack descriptions so it will be able to
+            # give us which pack directories must be read (with good order)
+            packer.load_pack_descriptions(path, configuration_level)
         
-        # Ask the packer to load pack descriptions so it will be able to
-        # give us which pack directories must be read (with good order)
-        packer.load_pack_descriptions(global_configuration, 'global')
-        packer.load_pack_descriptions(zone_configuration, 'zone')
-        packer.load_pack_descriptions(local_configuration, 'local')
-        
-        # Now that packs are load and clean, we can load collector code from it
-        configmgr.load_collectors_from_packs()
-        
-        # Now that packs are load and clean, we can load modules code from it
-        configmgr.load_modules_from_packs()
-        
-        # We load configuration from packs, but only the one we are sure we must load
-        configmgr.load_configuration_from_packs()
-        
-        # We can now give configuration to the collectors
-        collectormgr.get_parameters_from_packs()
-        
-        # We can now give configuration to the modules
-        modulemanager.get_parameters_from_packs()
-        
+        t0 = time.time()
         # We will now try to load the keywords from the modules
-        self.load_cli_mods(opts)
+        self._load_cli_mods(opts)
+        logger.debug('self.load_cli_mods :: %.3f' % (time.time() - t0))
     
     
     # We should look on the sys.argv if we find a valid keywords to
@@ -326,7 +369,7 @@ class CLICommander(object):
     
     
     # For some keywords, find (and create if need) the keywords entry in the keywords tree
-    def insert_keywords_entry(self, keywords, e):
+    def _insert_keywords_entry(self, keywords, e):
         
         # Simulate 'global' entry before top level entries
         if len(keywords) == 1:
@@ -357,12 +400,14 @@ class CLICommander(object):
         m_keywords = raw_entry.get('keywords', [])
         args = raw_entry.get('args', [])
         description = raw_entry.get('description', '')
-        e = CLIEntry(f, args, description, main_topic)
+        allow_temporary_agent = raw_entry.get('allow_temporary_agent', None)
+        need_full_configuration = raw_entry.get('need_full_configuration', False)
+        e = CLIEntry(f, args, description, allow_temporary_agent, main_topic, need_full_configuration)
         # Finally save it
-        self.insert_keywords_entry(m_keywords, e)
+        self._insert_keywords_entry(m_keywords, e)
     
     
-    def get_cli_entry_from_args(self, command_args):
+    def _get_cli_entry_from_args(self, command_args):
         logger.debug("ARGS: %s" % command_args)
         if len(command_args) == 1:
             command_args = ['global', command_args[0]]
@@ -379,7 +424,7 @@ class CLICommander(object):
         return ptr
     
     
-    def load_cli_mods(self, opts):
+    def _load_cli_mods(self, opts):
         global CONFIG
         # Main list of keywords for the first parameter
         self.keywords.clear()
@@ -414,7 +459,7 @@ class CLICommander(object):
                 exports = getattr(m, 'exports', {})
                 # get the topics from the pack definition
                 topics = packer.get_pack_all_topics(pname)
-                for (f, raw_entry) in exports.iteritems():
+                for (f, raw_entry) in exports.items():
                     self._create_cli_entry(f, raw_entry, topics)
         
         logger.debug('We load the keywords %s' % self.keywords)
@@ -435,20 +480,38 @@ class CLICommander(object):
         return []
     
     
+    # Look at entry like allow_temporary_agent and give a matching context
+    @staticmethod
+    def __get_execution_context(entry):
+        temp_agent = entry.allow_temporary_agent
+        if temp_agent is None:
+            return NoContextClass()
+        if temp_agent.get('enabled', False):
+            return AnyAgent()
+        return NoContextClass()
+    
+    
     # Execute a function based on the command line
     def one_loop(self, command_args):
         logger.debug("ARGS: %s" % command_args)
         
-        entry = self.get_cli_entry_from_args(command_args)
+        first_keyword = command_args[0]
+        
+        entry = self._get_cli_entry_from_args(command_args)
         if entry is None:
-            self.print_list(command_args[0])
-            return
+            self.print_list(first_keyword)
+            sys.exit(2)
         
         command_args = self.clean_command_args(command_args)
         
         # Now prepare a new parser, for the command call this time
         command_parser = optparse.OptionParser('', version="%prog " + VERSION)
         command_parser.prog = ''
+        
+        # Maybe it's not a end node, and we are in the middle, like "opsbro gossip zone"
+        if not isinstance(entry, CLIEntry):
+            self.print_list(first_keyword)
+            sys.exit(2)
         
         for a in entry.args:
             n = a.get('name', None)
@@ -474,7 +537,7 @@ class CLICommander(object):
                     d['type'] = 'int'
                 elif _type == 'float':
                     d['type'] = 'float'
-
+                
                 # and if we got a real default, use it
                 if not isinstance(default, Dummy):
                     d['default'] = default
@@ -483,18 +546,35 @@ class CLICommander(object):
         cmd_opts, cmd_args = command_parser.parse_args(command_args)
         f = entry.f
         logger.debug("CALLING " + str(f) + " WITH " + str(cmd_args) + " and " + str(cmd_opts))
-        try:
-            f(*cmd_args, **cmd_opts.__dict__)
-        except TypeError, exp:
-            logger.error('Bad call: missing or too much arguments: %s' % exp)
-            sys.exit(2)
-        except Exception, exp:
-            logger.error('The call did fail: %s' % (str(traceback.print_exc())))
+        
+        # Maybe the entry need to finish the loading to run (like dump configuration or such things)
+        if entry.need_full_configuration:
+            # Only print helper if we are inside a tty, if it's a | command, don't need this
+            if is_tty():
+                cprint(' * This command need the agent configuration to be loaded to be executed. This can take some few seconds.', color='grey', end='')
+                sys.stdout.flush()
+            configmgr.finish_to_load_configuration_and_objects()
+            if is_tty():
+                # Make the first line disapear, and clean it with space
+                cprint('\r' + ' ' * 150 + '\r', end='')
+                sys.stdout.flush()
+        
+        # Look if this call need a specific execution context, like a temporary agent
+        execution_ctx = self.__get_execution_context(entry)
+        with execution_ctx:
+            try:
+                f(*cmd_args, **cmd_opts.__dict__)
+            except TypeError as exp:
+                logger.error('Bad call: missing or too much arguments: %s (%s)' % (exp, str(traceback.print_exc())))
+                sys.exit(2)
+            except Exception:
+                logger.error('The call did fail: %s' % (str(traceback.print_exc())))
+                sys.exit(2)
     
     
     def print_completion(self, args):
         to_analayses = []
-        for (k, d) in self.keywords.iteritems():
+        for (k, d) in self.keywords.items():
             if k != 'global':
                 to_analayses.append([k])
                 for sub_k in d.keys():
@@ -506,7 +586,6 @@ class CLICommander(object):
         for to_analyse in to_analayses:
             # if we are too far in the command, cannot be this one
             if len(args) > len(to_analyse):
-                # print "SKIP impossible match", to_analyse
                 continue
         
         res = []
@@ -537,7 +616,6 @@ class CLICommander(object):
             perfect_match = False
             for to_analyse in to_analayses:
                 if to_analyse == args:
-                    # print "PERFECT FIT", to_analyse
                     perfect_match = True
             # Ok try to guess so
             if not perfect_match:
@@ -551,35 +629,101 @@ class CLICommander(object):
                     if propose_last_partial.startswith(last_partial):  # valid entry found
                         res.append(propose_last_partial)
         
-        print ' '.join(res)
+        cprint(' '.join(res))
         return
     
     
-    def __print_sub_level_tree(self, ptr, prefix):
-        cmds = ptr.keys()
+    @staticmethod
+    def __chunker(seq, size):
+        return [seq[pos:pos + size] for pos in xrange(0, len(seq), size)]
+    
+    
+    # Ok magic ahead: we will try to look at printing the options with color
+    # AND by looking at the terminal width to have a responsive display
+    def __print_sub_level_tree(self, ptr, prefix, first_level=False):
+        cmds = list(ptr.keys())  # note: python3 keys is not a list
         cmds.sort()
+        
+        _, term_width = self.__get_terminal_size()
+        
+        # We want to colorize only the first element, then
+        # grey common parts
+        full_colorize = True
         for k in cmds:
             entry = ptr[k]
             # Tree not finish? go for it
             if isinstance(entry, dict):
                 self.__print_sub_level_tree(entry, '%s %s' % (prefix, k))
                 continue
+            nb_chars = 0
             s = k.ljust(25)
             if prefix:
-                s = '%s %s' % (prefix, k)
-                s = s.ljust(25)
+                if full_colorize:
+                    # We need to get the size of the colorless verion, to have the number of spaces need
+                    colorless_s = '%s %s' % (prefix, k)
+                    len_colorless_raw = len(colorless_s)
+                    colorless_s = colorless_s.ljust(25)
+                    nb_chars += len(colorless_s)
+                    # now really colorize it
+                    s = '%s %s' % (prefix, sprintf(k, color='green'))
+                    if len_colorless_raw < 25:
+                        s = s + ' ' * (25 - len_colorless_raw)
+                    
+                    # Maybe the prefix was long, if so, do not
+                    _elts = prefix.split(' ')
+                    
+                    # The very first element must be green, then we must the prefix as grey
+                    first_part_color = 'green' if first_level else 'grey'
+                    new_elts = []
+                    new_elts.append((_elts[0], sprintf(_elts[0], color=first_part_color)))
+                    for p in _elts[1:]:
+                        new_elts.append((p, sprintf(p, color='green')))
+                    for (p, changed_p) in new_elts:
+                        s = s.replace(p, changed_p, 1)
+                    full_colorize = False
+                else:
+                    s = '%s %s' % (prefix, k)
+                    s = s.ljust(25)
+                    nb_chars += len(s)
+                    s = s.replace(prefix, sprintf(prefix, color='grey'), 1)
+                    s = s.replace(k, sprintf(k, color='green'), 1)
+            else:
+                # Simple level parameters, so banner, version, etc
+                nb_chars += len(s)  # note: before colorize it
+                s = sprintf(s, color='green')
             topic_color_ix = topiker.get_color_id_by_topic_string(entry.topic)
             topic_prefix = '%s' % (lolcat.get_line(CHARACTERS.vbar, topic_color_ix, spread=None))
             cprint(topic_prefix, end='')
             cprint('  opsbro ', color='grey', end='')
-            cprint('%s ' % s, 'green', end='')
-            cprint(': %s' % entry.description)
+            nb_chars += 13
+            cprint('%s ' % s, end='')
+            available_width = max(10, term_width - nb_chars)
+            cprint(': ', end='')
+            
+            # Responsive description display
+            description = entry.description
+            chunks = self.__chunker(description, available_width)
+            cprint(chunks[0])
+            if len(chunks) > 1:
+                for chunk in chunks[1:]:
+                    cprint(topic_prefix, end='')
+                    cprint(' ' * (nb_chars - 1), end='')
+                    cprint(chunk)
+    
+    
+    @staticmethod
+    def __get_terminal_size():
+        try:
+            height, width = get_terminal_size()
+        except:
+            height = width = 999
+        return height, width
     
     
     def print_list(self, keyword=''):
         cprint('')
         print_h1('Available commands')
-        sub_cmds = self.keywords.keys()
+        sub_cmds = list(self.keywords.keys())  # note: python 3 keys is not a list
         sub_cmds.remove('global')
         sub_cmds.sort()
         sub_cmds.insert(0, 'global')
@@ -601,6 +745,6 @@ class CLICommander(object):
             cprint(u'%-15s' % cmd, color='magenta', end='')
             numerical = 's' if len(topics_strings) > 1 else ''
             cprint(' (topic%s: %s)' % (numerical, ', '.join([topic_string for topic_string in topics_strings])), color='grey')
-            self.__print_sub_level_tree(d, prefix)
+            self.__print_sub_level_tree(d, prefix, first_level=True)
             cprint('')
         return

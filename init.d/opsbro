@@ -38,8 +38,8 @@ ETC=/etc/opsbro
 
 export PATH="${PATH:+$PATH:}/usr/sbin:/bin:/sbin"
 # Try to set US lang, to allow easy sub command call even on non english system (yes like french system...)
-export LANG=en_US.UTF8   2>/dev/null
-export LC_ALL=en_US.UTF8 2>/dev/null
+export LANG=en_US.UTF8   >/dev/null  2>/dev/null
+export LC_ALL=en_US.UTF8 >/dev/null 2>/dev/null
 # Please python, manage utf8 by default, we are in 2017
 export PYTHONIOENCODING=utf8
 # Do not lock on print calls
@@ -49,47 +49,13 @@ unset http_proxy
 unset https_proxy
 
 
-# We try to find the LAST possible Python VERSION
-pythonver() {
-    versions="2.6 2.7"
-    LASTFOUND=""
-    # Is there any python here?
-    for v in $versions
-    do
-        which python$v > /dev/null 2>&1
-        if [ $? -eq 0 ]
-        then
-            LASTFOUND="python$v"
-        fi
-    done
-    if [ -z "$LASTFOUND" ]
-    then
-        # Finaly try to find a default python
-        which python > /dev/null 2>&1
-        if [ $? -ne 0 ]
-        then
-            # Beware: maybe it's because which is not exiting itself! (like in docker centos images)
-            if [ -f "/usr/bin/python" ]; then
-                LASTFOUND="/usr/bin/python"
-            else
-                echo "No python interpreter found!"
-                exit 2
-            fi
-        else
-            echo "python found"
-            LASTFOUND=$(which python)
-        fi
-    fi
-    PYTHON=$LASTFOUND
-}
-
-# Ok, go search this Python version
-pythonver
-
+# We do not want systemd hook, as it hide our display and help message
+SYSTEMCTL_SKIP_REDIRECT=1
 
 
 # default
 DEBUG=false
+AUTO_DETECT=false
 
 ## This permits to overhidde the current values (PATH or things like this)
 OPSBRO_DEFAULT_FILE="/etc/default/opsbro"
@@ -102,13 +68,18 @@ usage() {
     cat << END
 Usage: $NAME [ --debug ] {start|stop|status|restart|reload|force-reload}
 
- --debug  start the daemon in debug mode, only useful with start|restart
-
+ --debug        start the daemon in debug mode, only useful with start|restart
+ --auto-detect  start the daemon in auto detection of a proxy node
 END
 }
 
 if [ "$1" = "--debug" ]; then
     DEBUG="1"
+    shift
+fi
+
+if [ "$1" = "--auto-detect" ]; then
+    AUTO_DETECT="1"
     shift
 fi
 
@@ -119,15 +90,6 @@ fi
 
 CMD=$1
 
-
-
-# Load the VERBOSE setting and other rcS variables
-[ -f /etc/default/rcS ] && . /etc/default/rcS
-
-# Source function library.
-[ -f /etc/rc.d/init.d/functions ] && . /etc/rc.d/init.d/functions
-
-[ -f /lib/lsb/init-functions ] && . /lib/lsb/init-functions
 
 
 OPSBRO_COLOR="\\033[94mOps\\033[0;39m*\\033[91mBro\\033[0;39m"
@@ -268,8 +230,29 @@ do_stop() {
         return 0
     }
     stopoutput=$(opsbro agent stop)
-    echo "OK"
-    return 0
+    sleep 1
+    out=$(opsbro agent info)
+    rc=$?
+    if [ $rc != 0 ];then
+       echo "OK"
+       return 0
+    fi
+    sleep 5
+    out=$(opsbro agent info)
+    rc=$?
+    if [ $rc != 0 ];then
+       echo "OK"
+       return 0
+    fi
+    sleep 30
+    out=$(opsbro agent info)
+    rc=$?
+    if [ $rc != 0 ];then
+       echo "OK"
+       return 0
+    fi
+    echo "Asked to stop but still running"
+    return 2
 }
 
 
@@ -289,9 +272,11 @@ do_start_() {
         return
     fi
 
-    #START
+    # START
     [ "$DEBUG" = 1 ] && DEBUGCMD="--debug "
-    output=$(opsbro $DEBUGCMD agent start --daemon  2>&1)
+    [ "$AUTO_DETECT" = 1 ] && AUTO_DETECTCMD="--auto-detect "
+
+    output=$(opsbro $DEBUGCMD agent start --daemon $AUTO_DETECTCMD  2>&1)
     rc=$?
 
     if [ $rc != 0 ]; then
@@ -300,34 +285,8 @@ do_start_() {
         return 1
     fi
 
-    # WAIT FOR INITIALISATION
-    TIMEOUT=60
-
-    for ii in `seq 1 $TIMEOUT`; do
-       print_starting_bro
-       echo_initializing
-       WAIT=$(opsbro agent wait-initialized --timeout 1)  # NOTE: timeout 1 as we are looping over it
-
-       # If bad result, maybe we are not at the limit and so we will loop again
-       if [ $? != 0 ]; then
-          # IF we reach the timeout, get out of this
-          if [ $ii == $TIMEOUT ]; then
-              print_starting_bro
-              echo_failed "FAILED (initialisation was not finish after $TIMEOUT seconds): $WAIT"
-              return 1
-          fi
-          # We did not reach the TIMEOUT, we can retry again
-          continue
-       fi
-       # We are OK? so we can quit this loop and live an happy life with our agent
-       break
-    done
-
-    # We are fully started, let's enjoy
-    print_starting_bro
-    echo_started
-
-    return 0
+    opsbro agent wait-initialized --timeout 60 --show-init-header
+    return $?
 }
 
 
@@ -353,7 +312,7 @@ do_stop_() {
 do_restart_() {
     printf "$COLOR_MAGENTA""Restarting$COLOR_RESET $OPSBRO_COLOR: "
     stopoutput=$(do_stop)
-    startoutput=$(do_start)
+    startoutput=$(do_start_)
     rc=$?
     if [ $rc -eq 0 ]; then
         echo_started
@@ -371,8 +330,8 @@ do_force-reload_() {
 do_reload_() {
     mod="$1"
     printf "$COLOR_MAGENTA""Reloading$COLOR_RESET $OPSBRO_COLOR: "
-    stopoutput=$(do_stop)
-    startoutput=$(do_start)
+    stopoutput=$(do_stop_)
+    startoutput=$(do_start_)
     rc=$?
     if [ $rc -eq 0 ]; then
         echo_started

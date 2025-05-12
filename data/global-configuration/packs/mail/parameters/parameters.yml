@@ -11,7 +11,7 @@ severities:
 
 # Who to notify
 contacts:
-    - admin@mydomain.com
+    - naparuba@gmail.com
 
 # The addr to send email from
 addr_from: opsbro@mydomain.com
@@ -25,3 +25,13 @@ smtps: false
 # Templates for the check alerts (mail subject & mail text)
 check_subject_template: mail-check-subject.tpl
 check_text_template: mail-check-text.tpl
+
+
+# Templates for the groups modifications (mail subject & mail text)
+group_subject_template: mail-group-subject.tpl
+group_text_template: mail-group-text.tpl
+
+
+# Templates for the compliance state change (mail subject & mail text)
+compliance_subject_template: mail-compliance-subject.tpl
+compliance_text_template: mail-compliance-text.tpl

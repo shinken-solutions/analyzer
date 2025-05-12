@@ -1,44 +1,54 @@
 import os
 import sys
+import codecs
+import time
 
-from opsbro.defaultpaths import DEFAULT_DATA_DIR
-from opsbro.log import LoggerFactory
-from opsbro.httpdaemon import http_export, response
-from opsbro.yamlmgr import yamler
-from opsbro.jsonmgr import jsoner
-from opsbro.packer import packer
+PY3 = sys.version_info >= (3,)
+if PY3:
+    basestring = str  # no basestring in python 3
+
+from .defaultpaths import DEFAULT_DATA_DIR
+from .log import LoggerFactory
+from .yamlmgr import yamler
+from .packer import packer
 
 # Global logger for this part
 logger = LoggerFactory.create_logger('configuration')
+
+ZONE_KEYS_DIRECTORY_NAME = 'zone_keys'
 
 
 class ConfigurationManager(object):
     # The parameter for the main cluster class is list here, and we will give back to it what we did read in the
     # local.yaml file (one set ones)
     cluster_parameters = {
-        'display_name'   : {'type': 'string', 'mapto': 'display_name'},
-        'port'           : {'type': 'int', 'mapto': 'port'},
-        'data'           : {'type': 'path', 'mapto': 'data_dir'},
-        'libexec'        : {'type': 'path', 'mapto': 'libexec_dir'},
-        'log'            : {'type': 'path', 'mapto': 'log_dir'},
-        'lock'           : {'type': 'path', 'mapto': 'lock_path'},
-        'socket'         : {'type': 'path', 'mapto': 'socket_path'},
-        'log_level'      : {'type': 'string', 'mapto': 'log_level'},
-        'bootstrap'      : {'type': 'bool', 'mapto': 'bootstrap'},
-        'seeds'          : {'type': 'list', 'mapto': 'seeds'},
-        'groups'         : {'type': 'list', 'mapto': 'groups'},
-        'encryption_key' : {'type': 'string', 'mapto': 'encryption_key'},
-        'master_key_priv': {'type': 'string', 'mapto': 'master_key_priv'},
-        'master_key_pub' : {'type': 'string', 'mapto': 'master_key_pub'},
-        'node-zone'      : {'type': 'string', 'mapto': 'zone'},
-        'proxy-node'     : {'type': 'bool', 'mapto': 'is_proxy'},
+        'display_name'                          : {'type': 'string', 'mapto': 'display_name'},
+        'process_name'                          : {'type': 'string', 'mapto': 'process_name'},
+        'port'                                  : {'type': 'int', 'mapto': 'port'},
+        'data'                                  : {'type': 'path', 'mapto': 'data_dir'},
+        'libexec'                               : {'type': 'path', 'mapto': 'libexec_dir'},
+        'log'                                   : {'type': 'path', 'mapto': 'log_dir'},
+        'lock'                                  : {'type': 'path', 'mapto': 'lock_path'},
+        'socket'                                : {'type': 'path', 'mapto': 'socket_path'},
+        'log_level'                             : {'type': 'string', 'mapto': 'log_level'},
+        'bootstrap'                             : {'type': 'bool', 'mapto': 'bootstrap'},
+        'seeds'                                 : {'type': 'list', 'mapto': 'seeds'},
+        'groups'                                : {'type': 'list', 'mapto': 'groups'},
+        'node-zone'                             : {'type': 'string', 'mapto': 'zone'},
+        'proxy-node'                            : {'type': 'bool', 'mapto': 'is_proxy'},
+        'service_discovery_topic_enabled'       : {'type': 'bool', 'mapto': 'service_discovery_topic_enabled'},
+        'automatic_detection_topic_enabled'     : {'type': 'bool', 'mapto': 'automatic_detection_topic_enabled'},
+        'monitoring_topic_enabled'              : {'type': 'bool', 'mapto': 'monitoring_topic_enabled'},
+        'metrology_topic_enabled'               : {'type': 'bool', 'mapto': 'metrology_topic_enabled'},
+        'configuration_automation_topic_enabled': {'type': 'bool', 'mapto': 'configuration_automation_topic_enabled'},
+        'system_compliance_topic_enabled'       : {'type': 'bool', 'mapto': 'system_compliance_topic_enabled'},
     }
     
     
     def __init__(self):
         # Keep a list of the knowns cfg objects type we will encounter
         # NOTE: will be extend once with the modules types
-        self.known_types = set(['check', 'service', 'compliance', 'generator', 'zone', 'installor', 'tutorial'])
+        self.known_types = set(['check', 'service', 'compliance', 'generator', 'zone', 'tutorial'])
         
         # The cluster starts with defualt parameters, but of course configuration can set them too
         # so we will load them (in the local.yaml file) and give it back to the cluster when it will need it
@@ -54,60 +64,66 @@ class ConfigurationManager(object):
         self.pack_parameters = {}
     
     
+    def get_data_dir(self):
+        return self.data_dir
+    
+    
     def get_monitoringmgr(self):
         # Import at runtime, to avoid loop
-        from opsbro.monitoring import monitoringmgr
+        from .monitoring import monitoringmgr
         return monitoringmgr
     
     
     def get_handlermgr(self):
-        from opsbro.handlermgr import handlermgr
+        from .handlermgr import handlermgr
         return handlermgr
     
     
     def get_compliancemgr(self):
-        from opsbro.compliancemgr import compliancemgr
+        from .compliancemgr import compliancemgr
         return compliancemgr
     
     
     def get_zonemgr(self):
-        from opsbro.zonemanager import zonemgr
+        from .zonemanager import zonemgr
         return zonemgr
     
     
-    def get_installormgr(self):
-        from opsbro.installermanager import installormgr
-        return installormgr
-    
-    
     def get_tutorialmgr(self):
-        from opsbro.tutorial import tutorialmgr
+        from .tutorial import tutorialmgr
         return tutorialmgr
     
     
     def get_modulemanager(self):
-        from opsbro.modulemanager import modulemanager
+        from .modulemanager import modulemanager
         return modulemanager
     
     
     def get_generatormgr(self):
-        from opsbro.generatormgr import generatormgr
+        from .generatormgr import generatormgr
         return generatormgr
     
     
     def get_detecter(self):
-        from opsbro.detectormgr import detecter
+        from .detectormgr import detecter
         return detecter
     
     
     def get_dashboarder(self):
-        from opsbro.dashboardmanager import get_dashboarder
+        from .dashboardmanager import get_dashboarder
         return get_dashboarder()
     
     
     # the cluster is asking me which parameters are set in the local.yaml file
     def get_parameters_for_cluster_from_configuration(self):
         return self.parameters_for_cluster_from_configuration
+    
+    
+    def load_main_cfg_dir(self, cfg_dir):
+        self.main_cfg_directory = cfg_dir
+        # also compute other directories from this
+        self.zone_keys_directory = os.path.join(self.main_cfg_directory, ZONE_KEYS_DIRECTORY_NAME)
+        self.load_cfg_dir(self.main_cfg_directory, load_focus='agent')
     
     
     def load_cfg_dir(self, cfg_dir, load_focus, pack_name='', pack_level=''):
@@ -117,7 +133,7 @@ class ConfigurationManager(object):
         for root, dirs, files in os.walk(cfg_dir):
             for name in files:
                 fp = os.path.join(root, name)
-                # Only json and yml are interesting
+                # Only yml are interesting
                 if not name.endswith('.yml'):
                     continue
                 logger.debug('Loader: looking for cfg file: %s' % fp)
@@ -138,8 +154,6 @@ class ConfigurationManager(object):
                     self.load_generator_object(obj, fp, pack_name=pack_name, pack_level=pack_level)
                 elif load_focus == 'detector':
                     self.load_detector_object(obj, fp, pack_name=pack_name, pack_level=pack_level)
-                elif load_focus == 'installor':
-                    self.load_installor_object(obj, fp, pack_name=pack_name, pack_level=pack_level)
                 elif load_focus == 'dashboard':
                     self.load_dashboard_object(obj, fp, pack_name=pack_name, pack_level=pack_level)
                 elif load_focus == 'parameter':
@@ -153,19 +167,15 @@ class ConfigurationManager(object):
     
     
     def __get_object_from_cfg_file(self, fp, force_document_comment_to_first_entry=False):
-        is_yaml = fp.endswith('.yml')
-        with open(fp, 'r') as f:
+        with codecs.open(fp, 'r', 'utf8') as f:
             buf = f.read()
             try:
-                if is_yaml:
-                    o = yamler.loads(buf, force_document_comment_to_first_entry=force_document_comment_to_first_entry)
-                else:
-                    raise Exception('Unknown file extension: %s' % fp)
-            except Exception, exp:
+                o = yamler.loads(buf, force_document_comment_to_first_entry=force_document_comment_to_first_entry)
+                logger.debug("Configuration, opening file data", o, fp)
+                return o
+            except Exception as exp:
                 logger.error('ERROR: the configuration file %s malformed: %s' % (fp, exp))
                 sys.exit(2)
-        logger.debug("Configuration, opening file data", o, fp)
-        return o
     
     
     # pid, log & zones
@@ -173,11 +183,11 @@ class ConfigurationManager(object):
         if 'zone' in o:
             zone = o['zone']
             zonemgr = self.get_zonemgr()
-            zonemgr.add(zone)
+            zonemgr.add_zone(zone)
         
         # grok all others data so we can use them in our checks
         cluster_parameters = self.__class__.cluster_parameters
-        for (k, v) in o.iteritems():
+        for (k, v) in o.items():
             # check, service, ... are already managed
             if k in self.known_types:
                 continue
@@ -270,7 +280,7 @@ class ConfigurationManager(object):
             
             mod_time = int(os.path.getmtime(fp))
             fname = fp
-            gname = os.path.splitext(fname)[0]
+            gname = os.path.splitext(os.path.basename(fname))[0]
             generatormgr = self.get_generatormgr()
             generatormgr.import_generator(generator, fname, gname, mod_time=mod_time, pack_name=pack_name, pack_level=pack_level)
     
@@ -286,19 +296,6 @@ class ConfigurationManager(object):
             gname = os.path.splitext(fname)[0]
             detecter = self.get_detecter()
             detecter.import_detector(detector, 'file:%s' % fname, gname, mod_time=mod_time, pack_name=pack_name, pack_level=pack_level)
-    
-    
-    def load_installor_object(self, o, fp, pack_name, pack_level):
-        if 'installor' in o:
-            installor = o['installor']
-            if not isinstance(installor, dict):
-                logger.error('ERROR: the installor from the file %s is not a valid dict (%s found)' % (fp, type(installor)))
-                sys.exit(2)
-            mod_time = int(os.path.getmtime(fp))
-            fname = fp
-            gname = os.path.splitext(fname)[0]
-            installormgr = self.get_installormgr()
-            installormgr.import_installor(installor, fname, gname, mod_time=mod_time, pack_name=pack_name, pack_level=pack_level)
     
     
     def load_dashboard_object(self, o, fp, pack_name, pack_level):
@@ -319,7 +316,7 @@ class ConfigurationManager(object):
         if pack_name not in self.pack_parameters:
             self.pack_parameters[pack_name] = {'pack_level': pack_level, 'properties': {}}
         pack_entry = self.pack_parameters[pack_name]
-        for (k, v) in o.iteritems():
+        for (k, v) in o.items():
             pack_entry['properties'][k] = v
     
     
@@ -351,7 +348,7 @@ class ConfigurationManager(object):
             # dir, load_focus
             _types = [('monitoring', 'monitoring'),
                       ('generators', 'generator'), ('parameters', 'parameter'),
-                      ('detectors', 'detector'), ('installors', 'installor'),
+                      ('detectors', 'detector'),
                       ('compliance', 'compliance'), ('dashboards', 'dashboard'),
                       ('tutorials', 'tutorial'),
                       ]
@@ -363,7 +360,7 @@ class ConfigurationManager(object):
     
     def load_collectors_from_packs(self):
         # Load at running to avoid endless import loop
-        from opsbro.collectormanager import collectormgr
+        from .collectormanager import collectormgr
         pack_directories = packer.give_pack_directories_to_load()
         
         for (pname, level, dir) in pack_directories:
@@ -376,10 +373,82 @@ class ConfigurationManager(object):
         collectormgr.load_all_collectors()
     
     
+    def load_hostingdrivers_from_packs(self):
+        # Load at running to avoid endless import loop
+        from .hostingdrivermanager import get_hostingdrivermgr
+        hostingctxmgr = get_hostingdrivermgr()
+        pack_directories = packer.give_pack_directories_to_load()
+        
+        for (pname, level, dir) in pack_directories:
+            # Now load collectors, an important part for packs :)
+            hostingdriver_dir = os.path.join(dir, 'hostingdrivers')
+            if os.path.exists(hostingdriver_dir):
+                hostingctxmgr.load_directory(hostingdriver_dir, pack_name=pname, pack_level=level)
+        
+        # now hosting driver class are loaded, we can detect which one is our own
+        hostingctxmgr.detect()
+    
+    
+    def load_compliancebackends_from_packs(self):
+        # Load at running to avoid endless import loop
+        from .compliancemgr import compliancemgr
+        pack_directories = packer.give_pack_directories_to_load()
+        
+        for (pname, level, dir) in pack_directories:
+            # Now load collectors, an important part for packs :)
+            drv_dir = os.path.join(dir, 'compliancebackends')
+            if os.path.exists(drv_dir):
+                compliancemgr.load_directory(drv_dir, pack_name=pname, pack_level=level)
+        
+        # now hosting driver class are loaded, we can load all
+        compliancemgr.load_backends()
+    
+    
+    def finish_to_load_configuration_and_objects(self):
+        t0 = time.time()
+        # Now that packs are load and clean, we can load collector code from it
+        self.load_collectors_from_packs()
+        logger.debug('configmgr.load_collectors_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # load all compliance drivers
+        self.load_compliancebackends_from_packs()
+        logger.debug('configmgr.load_compliancebackends_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # Now that packs are load and clean, we can load modules code from it
+        self.load_modules_from_packs()
+        logger.debug('configmgr.load_modules_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # We load configuration from packs, but only the one we are sure we must load
+        self.load_configuration_from_packs()
+        logger.debug('configmgr.load_configuration_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # also load hosting driver (like EC2 or scaleway) from packs too
+        configmgr.load_hostingdrivers_from_packs()
+        logger.debug('configmgr.load_hostingdrivers_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # We can now give configuration to the collectors
+        from .collectormanager import collectormgr
+        collectormgr.get_parameters_from_packs()
+        logger.debug('configmgr.get_parameters_from_packs :: %.3f' % (time.time() - t0))
+        
+        t0 = time.time()
+        # We can now give configuration to the modules
+        from .modulemanager import modulemanager
+        modulemanager.get_parameters_from_packs()
+        logger.debug('modulemanager.get_parameters_from_packs :: %.3f' % (time.time() - t0))
+    
+    
     ############## Http interface
     # We must create http callbacks in running because
     # we must have the self object
     def export_http(self):
+        from .httpdaemon import http_export, response
+        
         @http_export('/configuration/parameters')
         def dump_parameters():
             response.content_type = 'application/json'

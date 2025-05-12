@@ -1,9 +1,9 @@
-import time
 import socket
 
 from opsbro.collector import Collector
 from opsbro.parameters import StringParameter, IntParameter
 from opsbro.now import NOW
+from opsbro.util import unicode_to_bytes, bytes_to_unicode
 
 
 # Parse the result of Redis's INFO command into a Python dict
@@ -59,22 +59,27 @@ class Redis(Collector):
         super(Redis, self).__init__()
         self.store = {}
         self.last_launch = 0.0
+        self.info_packet = unicode_to_bytes('INFO\n')  # what we need to send to redis
     
     
     def launch(self):
+        if not self.is_in_group('redis'):
+            self.set_not_eligible('Please add the redis group to enable this collector.')
+            return
+        
         addr = '127.0.0.1'
         port = 6379
-        logger = self.logger
         
         start = NOW.monotonic()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((addr, port))
-            s.send('INFO\n')
+            s.send(self.info_packet)
             buf = s.recv(8096)
+            buf = bytes_to_unicode(buf)
             s.close()
-        except Exception, exp:
-            logger.debug('Cannot connect to redis at %s:%d : %s' % (addr, port, exp))
+        except Exception as exp:
+            self.set_error('Cannot connect to redis at %s:%d : %s' % (addr, port, exp))
             return {'available': False}
         info = parse_info(buf)
         
@@ -87,7 +92,7 @@ class Redis(Collector):
         info['available'] = True
         
         to_add = {}
-        for (k, v) in info.iteritems():
+        for (k, v) in info.items():
             if k in self.RATE_KEYS:
                 if k in self.store:
                     nv = (v - self.store[k]) / diff

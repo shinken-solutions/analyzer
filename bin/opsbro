@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
 # Copyright (C) 2014:
 #    Gabes Jean, naparuba@gmail.com
@@ -20,8 +21,6 @@ import sys
 import os
 
 CLI = None
-
-
 
 CONFIG = {}
 
@@ -58,17 +57,16 @@ if __name__ == '__main__':
     parser.error = old_error
     
     # We need to import our libs, but can be an install or directly in the tarball (if executed directly from the install tar ball)
-    install_less = False
     # In windows exe, __file__ is not set
     if not hasattr(sys, 'frozen'):
-	    my_file = os.path.abspath(os.path.dirname(__file__))
+        my_file = os.path.abspath(os.path.dirname(__file__))
     else:
-	    my_file = os.path.dirname(os.path.abspath(sys.argv[0]))
+        my_file = os.path.dirname(os.path.abspath(sys.argv[0]))
     my_root_dir = os.path.dirname(my_file)
+    
     # Both files must be present
     tar_ball_detection_files = (os.path.join(my_root_dir, 'README.md'), os.path.join(my_root_dir, 'setup.py'))
     if os.path.exists(tar_ball_detection_files[0]) and os.path.exists(tar_ball_detection_files[1]):
-        install_less = True
         # Be sure that the opsbro lib is the install root one
         sys.path.insert(0, my_root_dir)
         from opsbro.defaultpaths import remap_from_install_dir
@@ -81,7 +79,7 @@ if __name__ == '__main__':
     from opsbro.info import BANNER, TXT_BANNER
     from opsbro.misc.bro_quotes import get_quote
     from opsbro.yamlmgr import yamler
-
+    
     # We should save our current opsbro binary, for debug purpose or sub spawn of some cli calls
     save_current_binary(sys.argv[0])
     
@@ -106,7 +104,7 @@ if __name__ == '__main__':
                 buf = f.read()
                 CONFIG = yamler.loads(buf)
             logger.debug("Loaded configuration file %s : %s" % (opts.ymlconfig, CONFIG))
-        except Exception, exp:
+        except Exception as exp:
             logger.error('Cannot load configuration file %s: %s' % (opts.ymlconfig, exp))
             sys.exit(2)
     

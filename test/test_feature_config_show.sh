@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
-echo "Starting to test agent parameters show"
+# Load common shell functions
+MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+. $MYDIR/common_shell_functions.sh
+
+
+print_header "Starting to test agent parameters show"
 
 opsbro agent parameters show
 
@@ -10,4 +15,4 @@ if [ $? != 0 ]; then
 fi
 
 
-echo "opsbro agent parameters show OK"
+exit_if_no_crash "opsbro agent parameters show OK"

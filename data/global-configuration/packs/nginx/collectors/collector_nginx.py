@@ -1,8 +1,7 @@
-import httplib  # Used only for handling httplib.HTTPException (case #26701)
 import re
-import urllib2
 import traceback
 
+from opsbro.httpclient import get_http_exceptions, httper
 from opsbro.collector import Collector
 from opsbro.parameters import StringParameter
 
@@ -12,39 +11,28 @@ class Nginx(Collector):
         'uri': StringParameter(default='http://localhost/nginx_status'),
     }
     
+    def __init__(self):
+        super(Nginx, self).__init__()
+        self.nginxRequestsStore = None
+        
     
     def launch(self):
         logger = self.logger
+        
+        if not self.is_in_group('nginx'):
+            self.set_not_eligible('Please add the nginx group to enable this collector.')
+            return
         
         logger.debug('getNginxStatus: start')
         
         logger.debug('getNginxStatus: config set')
         
         try:
-            logger.debug('getNginxStatus: attempting urlopen')
+            response = httper.get(self.get_parameter('uri'), timeout=3)
+        except get_http_exceptions() as exp:
+            self.set_error('Unable to get Nginx status - HTTPError = %s' % exp)
+            return False
             
-            req = urllib2.Request(self.get_parameter('uri'), None, {})
-            
-            # Do the request, log any errors
-            request = urllib2.urlopen(req)
-            response = request.read()
-        
-        except urllib2.HTTPError, e:
-            self.error('Unable to get Nginx status - HTTPError = %s' % e)
-            return False
-        
-        except urllib2.URLError, e:
-            self.error('Unable to get Nginx status - URLError = %s' % e)
-            return False
-        
-        except httplib.HTTPException, e:
-            self.error('Unable to get Nginx status - HTTPException = %s' % e)
-            return False
-        
-        except Exception, e:
-            self.error('Unable to get Nginx status - Exception = %s' % traceback.format_exc())
-            return False
-        
         logger.debug('getNginxStatus: urlopen success, start parsing')
         
         # Thanks to http://hostingfu.com/files/nginx/nginxstats.py for this code
@@ -91,5 +79,5 @@ class Nginx(Collector):
                 return False
         
         except Exception:
-            self.error('Unable to get Nginx status - %s - Exception = %s' % (response, traceback.format_exc()))
+            self.set_error('Unable to get Nginx status - %s - Exception = %s' % (response, traceback.format_exc()))
             return False

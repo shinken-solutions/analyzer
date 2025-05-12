@@ -1,6 +1,6 @@
 #!/usr/bin/python
-
 # -*- coding: utf-8 -*-
+from __future__ import print_function
 
 import os
 import sys
@@ -9,12 +9,21 @@ import stat
 import optparse
 import shutil
 import imp
-from cStringIO import StringIO
+import codecs
+
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import StringIO
 from glob import glob
 import atexit
 
 # We have some warnings because we reimport some libs. We don't want them to be shown at install
 import warnings
+
+PY3 = sys.version_info >= (3,)
+if PY3:
+    basestring = str  # no basestring in python 3
 
 
 def _disable_warns(*args, **kwargs):
@@ -28,15 +37,15 @@ warnings.showwarning = _disable_warns
 python_version = sys.version_info
 if python_version < (2, 6):
     sys.exit("OpsBro require as a minimum Python 2.6, sorry")
-elif python_version >= (3,):
-    sys.exit("OpsBro is not yet compatible with Python 3.x, sorry")
+# elif python_version >= (3,):
+#    sys.exit("OpsBro is not yet compatible with Python 3.x, sorry")
 
 package_data = ['*.py']
 
 # Is this setup.py call for a pypi interaction? if true, won't hook lot of things
 is_pypi_register_upload = ('register' in sys.argv or ('sdist' in sys.argv and 'upload' in sys.argv))
 if is_pypi_register_upload:
-    print "Pypi specal mode activated, skipping some black magic"
+    print("Pypi specal mode activated, skipping some black magic")
     if '-v' not in sys.argv:
         sys.argv.append('-v')
 
@@ -49,7 +58,7 @@ is_pip_real_install_step = 'bdist_wheel' in sys.argv
 # * copy /etc
 # * look for dependencies from system packages
 # * hide setup.py part
-# If not blac kmagic (like in pip first step, or pypi interaction (upload, etc)
+# If not black kmagic (like in pip first step, or pypi interaction (upload, etc)
 # we do not want any black magic thing, and we try to behave like a standard python package ^^
 # By default we love black magic, but if we are in a pip special call or pypi, we disable it
 allow_black_magic = not is_pypi_register_upload and not is_pip_first_step
@@ -61,7 +70,7 @@ orig_sys_argv = sys.argv[:]
 ##################################       Utility functions for files
 # helper function to read the README file
 def read(fname):
-    return open(os.path.join(os.path.dirname(__file__), fname)).read()
+    return codecs.open(os.path.join(os.path.dirname(__file__), fname), 'r', 'utf8').read()
 
 
 # Do a chmod -R +x
@@ -87,7 +96,7 @@ def _chmodplusx(d):
 stdout_orig = sys.stdout
 stderr_orig = sys.stderr
 stdout_catched = StringIO()
-stderr_redirect_path = '/tmp/stderr.opsbro.tmp'
+stderr_redirect_path = '/tmp/stderr.opsbro.tmp' if os.name != 'nt' else r'c:\stderr.opsbro.tmp'
 stderr_redirect = None
 stderr_orig_bkp = None
 
@@ -164,14 +173,21 @@ try:
     
     prev_path = os.path.dirname(opsbro_test_import.__file__)
     del opsbro_test_import
-except ImportError, exp:  # great, first install so
+    # But to be sure future opsbro import will load the new one, we need to
+    # first hard unload the opsbro modules from python
+    # NOTE: this is only ok because we are in the setup.py, don't do this outside this scope!
+    all_modules = list(sys.modules.keys())
+    for modname in all_modules:
+        if modname == 'opsbro' or modname.startswith('opsbro.'):
+            del sys.modules[modname]
+except ImportError as exp:  # great, first install so
     pass
 
 # Now look at loading the local opsbro lib for version and banner
 my_dir = os.path.dirname(os.path.abspath(__file__))
 opsbro = imp.load_module('opsbro', *imp.find_module('opsbro', [os.path.realpath(my_dir)]))
 from opsbro.info import VERSION, BANNER, TXT_BANNER
-from opsbro.log import cprint, is_tty, sprintf, logger
+from opsbro.log import cprint, is_tty, sprintf, core_logger
 from opsbro.misc.bro_quotes import get_quote
 from opsbro.systempacketmanager import get_systepacketmgr
 from opsbro.cli_display import print_h1
@@ -180,17 +196,17 @@ from opsbro.characters import CHARACTERS
 systepacketmgr = get_systepacketmgr()
 
 ##################################       Only root as it's a global system tool.
-if os.getuid() != 0:
+if os.name != 'nt' and os.getuid() != 0:
     cprint('Setup must be launched as root.', color='red')
     sys.exit(2)
 
 # By default logger should not print anything
-logger.setLevel('ERROR')
+core_logger.setLevel('ERROR')
 # By maybe we are in verbose more?
 if '-v' in sys.argv or os.environ.get('DEBUG_INSTALL', '0') == '1':
-    logger.setLevel('DEBUG')
+    core_logger.setLevel('DEBUG')
 
-logger.debug('SCRIPT: install/update script was call with arguments: %s' % orig_sys_argv)
+core_logger.debug('SCRIPT: install/update script was call with arguments: %s' % orig_sys_argv)
 
 what = 'Installing' if not is_update else 'Updating'
 title = sprintf('%s' % what, color='magenta', end='') + sprintf(' OpsBro to version ', end='') + sprintf('%s' % VERSION, color='magenta', end='')
@@ -219,7 +235,7 @@ if allow_black_magic:
         cprint('    * Using the ', end='')
         cprint('update process', color='magenta')
     
-    print ''
+    print('')
 
 if '--update' in args or opts.upgrade or '--upgrade' in args:
     if 'update' in args:
@@ -306,30 +322,34 @@ elif 'bsd' in sys.platform or 'dragonfly' in sys.platform:
         )
     ]
 else:
-    raise "Unsupported platform, sorry"
-    data_files = []
+    raise Exception("Unsupported platform, sorry")
 
 # Beware to install scripts in the bin dir
 # compute scripts
 scripts = [s for s in glob('bin/opsbro*') if not s.endswith('.py')]
 data_files.append((default_paths['bin'], scripts))
 
+
+def _get_all_from_directory(dirname, path_key, filter_dir=None):
+    rename_patern_string = r"^(%s\/|%s$)" % (dirname, dirname)
+    rename_patern = re.compile(rename_patern_string)
+    directory = dirname
+    if filter_dir:
+        directory = os.path.join(dirname, filter_dir)
+    for path, subdirs, files in os.walk(directory):
+        dest_path = os.path.join(default_paths[path_key], rename_patern.sub("", path))
+        # for void directories
+        if len(files) == 0:
+            configuration_files.append((dest_path, []))
+        for name in files:
+            configuration_files.append((dest_path, [os.path.join(path, name)]))
+
+
 if not is_update:
-    ## get all files + under-files in etc/ except daemons folder
-    for path, subdirs, files in os.walk('etc'):
-        # for void directories
-        if len(files) == 0:
-            configuration_files.append((os.path.join(default_paths['etc'], re.sub(r"^(etc\/|etc$)", "", path)), []))
-        for name in files:
-            configuration_files.append((os.path.join(default_paths['etc'], re.sub(r"^(etc\/|etc$)", "", path)),
-                                        [os.path.join(path, name)]))
-    ## get all files + under-files in etc/ except daemons folder
-    for path, subdirs, files in os.walk('data'):
-        # for void directories
-        if len(files) == 0:
-            configuration_files.append((os.path.join(default_paths['var'], re.sub(r"^(data\/|data$)", "", path)), []))
-        for name in files:
-            configuration_files.append((os.path.join(default_paths['var'], re.sub(r"^(data\/|data$)", "", path)), [os.path.join(path, name)]))
+    _get_all_from_directory('etc', 'etc')
+    _get_all_from_directory('data', 'var')
+else:  # only take core directory for update
+    _get_all_from_directory('data', 'var', filter_dir='core-configuration')
 
 # Libexec is always installed
 for path, subdirs, files in os.walk('libexec'):
@@ -353,46 +373,110 @@ for o in not_allowed_options:
 ##################################       Look at prerequites, and if possible fix them with the system package instead of pip
 
 if allow_black_magic:
-    print ''
+    print('')
     title = 'Checking prerequites ' + sprintf('(1/3)', color='magenta', end='')
     print_h1(title, raw_title=True)
 
 # Maybe we won't be able to setup with packages, if so, switch to pip :(
 install_from_pip = []
 
-mod_need = {
-    'jinja2': {
-        'packages': {
-            'debian'      : 'python-jinja2', 'ubuntu': 'python-jinja2',
-            'amazon-linux': 'python-jinja2', 'centos': 'python-jinja2', 'redhat': 'python-jinja2', 'oracle-linux': 'python-jinja2', 'fedora': 'python-jinja2', 'opensuse': 'python-Jinja2',
-            'alpine'      : 'py-jinja2',
-        }
-    },
-    'Crypto': {
-        'packages': {
-            'debian'      : 'python-crypto', 'ubuntu': 'python-crypto',
-            'amazon-linux': 'python-crypto', 'centos': 'python-crypto', 'redhat': 'python-crypto', 'oracle-linux': 'python-crypto', 'fedora': 'python-crypto', 'opensuse': 'python-pycrypto',
-            'alpine'      : 'py-crypto',
-        }
-    },
-}
-# leveldb is not available on windows
-if os.name != 'nt':
-    mod_need['leveldb'] = {
-        'packages'    : {
-            'debian'      : 'python-leveldb', 'ubuntu': 'python-leveldb',
-            'amazon-linux': 'python-leveldb', 'centos': 'python-leveldb', 'redhat': 'python-leveldb', 'oracle-linux': 'python-leveldb', 'fedora': 'python-leveldb', 'opensuse': 'python-leveldb',
-            'alpine'      : 'py-leveldb',
+# Python 3 and 2 have differents packages
+if PY3:
+    mod_need = {
+        'jinja2': {
+            'packages': {
+                'debian'       : 'python3-jinja2',
+                'ubuntu'       : 'python3-jinja2',
+                'amazon-linux' : 'python3-jinja2',
+                'amazon-linux2': 'python3-jinja2',
+                'centos'       : 'python3-jinja2',
+                'redhat'       : 'python3-jinja2',
+                'oracle-linux' : 'python3-jinja2',
+                'fedora'       : 'python3-jinja2',
+                'opensuse'     : 'python3-Jinja2',
+                'alpine'       : 'py3-jinja2',
+            }
         },
-        'pip_packages': {
-            'debian'      : ['build-essential', 'python-dev'], 'ubuntu': ['build-essential', 'python-dev'],
-            # NOTE: amazon: no python-devel/python-setuptools, only versionsed packages are available
-            'amazon-linux': ['gcc', 'gcc-c++', 'python27-devel', 'libyaml-devel', 'python27-setuptools'], 'centos': ['gcc', 'gcc-c++', 'python-devel', 'libyaml-devel'], 'redhat': ['gcc', 'gcc-c++', 'python-devel', 'libyaml-devel'],
-            'oracle-linux': ['gcc', 'gcc-c++', 'python-devel', 'libyaml-devel'],
-            'fedora'      : [r'gcc-c++', 'libcurl', 'curl', 'libcurl-devel', 'python', 'gcc', 'python-devel', 'libyaml-devel', 'python-setuptools', 'redhat-rpm-config'],  # note: python-setuptools to be sure that setup() will succeed
-            'alpine'      : ['gcc', 'linux-headers', 'musl-dev', 'libgcc', 'libgc++', 'g++', 'curl-dev', 'py-setuptools', 'python-dev'],
+        'Crypto': {
+            'packages': {
+                'debian'       : 'python3-crypto',
+                'ubuntu'       : 'python3-crypto',
+                'amazon-linux' : 'python3-crypto',
+                'amazon-linux2': 'python3-crypto',
+                'centos'       : 'python3-crypto',
+                'redhat'       : 'python3-crypto',
+                'oracle-linux' : 'python3-crypto',
+                'fedora'       : 'python3-crypto',
+                'opensuse'     : 'python3-pycrypto',
+                'alpine'       : 'py3-crypto',
+            }
         },
     }
+else:
+    mod_need = {
+        'jinja2': {
+            'packages': {
+                'debian'       : 'python-jinja2',
+                'ubuntu'       : 'python-jinja2',
+                'amazon-linux' : 'python-jinja2',
+                'amazon-linux2': 'python-jinja2',
+                'centos'       : 'python-jinja2',
+                'redhat'       : 'python-jinja2',
+                'oracle-linux' : 'python-jinja2',
+                'fedora'       : 'python-jinja2',
+                'opensuse'     : 'python-Jinja2',
+                'alpine'       : 'py-jinja2',
+            }
+        },
+        'Crypto': {
+            'packages': {
+                'debian'       : 'python-crypto',
+                'ubuntu'       : 'python-crypto',
+                'amazon-linux' : 'python-crypto',
+                'amazon-linux2': 'python-crypto',
+                'centos'       : 'python-crypto',
+                'redhat'       : 'python-crypto',
+                'oracle-linux' : 'python-crypto',
+                'fedora'       : 'python-crypto',
+                'opensuse'     : 'python-pycrypto',
+                'alpine'       : 'py-crypto',
+            }
+        },
+    }
+
+# Some distro have another name for python-setuptools, so list here only exceptions
+setuptools_package_exceptions = {
+    'alpine'       : 'py-setuptools',
+    'amazon-linux' : 'python27-setuptools',
+    'amazon-linux2': 'python2-setuptools',
+}
+
+
+# Centos 7.0 and 7.1 have issues to access to the epel release (due to certificates)
+# and I don't find how to fix unless remove the https access to it
+# if someone have a better solution, with only packages update, I take :)
+def _fix_centos_7_epel_no_https():
+    epel = '/etc/yum.repos.d/epel.repo'
+    if os.path.exists(epel):
+        with open(epel, 'r') as f:
+            lines = f.readlines()
+        # sed 'mirrorlist=https:' into 'mirrorlist=http:'
+        # and mirrorlist=https: into mirrorlist=https: (centos 6)
+        new_file = ''.join([line.replace('metalink=https:', 'metalink=http:').replace('mirrorlist=https:', 'mirrorlist=http:') for line in lines])
+        with open(epel, 'w') as f:
+            f.write(new_file)
+
+
+# Some distro have specific dependencies
+distro_prerequites = {
+    'alpine': [{'package_name': 'musl-dev'}],  # monotonic clock
+    'centos': [
+        {'package_name': 'libgomp'},  # monotonic clock
+        {'package_name': 'nss', 'only_for': ['6.6', '6.7', '7.0', '7.1'], 'force_update': True},  # force update of nss for connect to up to date HTTPS, especialy epel
+        {'package_name': 'epel-release', 'only_for': ['6.7', '7.0', '7.1'], 'post_fix': _fix_centos_7_epel_no_https},  # need for leveldb, and post_fix is need for 6.7
+        {'package_name': 'leveldb', 'only_for': ['7.0', '7.1']},  # sqlite on old centos is broken
+    ],
+}
 
 # If we are uploading to pypi, we just don't want to install/update packages here
 if not allow_black_magic:
@@ -406,7 +490,6 @@ system_distro, system_distroversion, _ = systepacketmgr.get_distro()
 # great....
 additionnal_pypi_repos = []
 if allow_black_magic:
-    # if system_distro in ['debian', 'centos'] and system_distroversion.startswith('6.'):
     additionnal_pypi_repos.append('https://pypi.python.org/pypi/leveldb/')
 
 if allow_black_magic:
@@ -425,8 +508,8 @@ if allow_black_magic:
         cprint("   - it won't use the package system to install dependencies")
         cprint("   - and so it will use the python pip dependency system instead (internet connection is need).")
 
-for (m, d) in mod_need.iteritems():
-    cprint(' * checking dependency for ', end='')
+for (m, d) in mod_need.items():
+    cprint(' * Checking dependency for ', end='')
     cprint('%-20s' % m, color='blue', end='')
     cprint(' : ', end='')
     sys.stdout.flush()
@@ -453,28 +536,106 @@ for (m, d) in mod_need.iteritems():
                     systepacketmgr.update_or_install(pkg)
                     cprint('%s' % CHARACTERS.check, color='green')
                     # __import__(m)
-                except Exception, exp:
+                except Exception as exp:
                     cprint('(missing in package)', color='cyan')
                     cprint('   - cannot install the package from the system. Switching to an installation based on the python pip system (need an internet connection)', color='grey')
                     _prefix = '      | '
                     cprint('\n'.join(['%s%s' % (_prefix, s) for s in str(exp).splitlines()]), color='grey')
                     
                     install_from_pip.append(pip_failback)
-                    all_pip_packages = d.get('pip_packages', {})
-                    pip_packages = all_pip_packages.get(system_distro, [])
-                    for pip_pkg in pip_packages:
-                        try:
-                            cprint('   - Install from system package the python lib dependency: ', color='grey', end='')
-                            cprint(pip_pkg)
-                            systepacketmgr.update_or_install(pip_pkg)
-                        except Exception, exp:
-                            cprint('    - WARNING: cannot install python lib dependency: %s : %s' % (pip_pkg, exp))
-                            
-                            # Remove duplicate from pip install
+
+if allow_black_magic:
+    distro_specific_packages = distro_prerequites.get(system_distro, [])
+    if len(distro_specific_packages) >= 1:
+        cprint(' * This OS have specific prerequites:')
+    for package in distro_specific_packages:
+        package_name = package.get('package_name')
+        only_for = package.get('only_for', [])
+        # Maybe this package is only for specific versions, like old centos 7 versions
+        if len(only_for) != 0:
+            match_version = False
+            for only_for_version in only_for:
+                if system_distroversion.startswith(only_for_version):
+                    match_version = True
+            if not match_version:
+                continue
+        force_update = package.get('force_update', False)  # should be updated even if already installed
+        post_fix = package.get('post_fix', None)  # function called AFTER the package installation, to fix something
+        cprint('   - Prerequite for ', color='grey', end='')
+        cprint(system_distro, color='magenta', end='')
+        cprint(' : ', color='grey', end='')
+        cprint('%-20s' % package_name, color='blue', end='')
+        cprint('       from system packages  : ', color='grey', end='')
+        sys.stdout.flush()
+        try:
+            if not systepacketmgr.has_package(package_name) or force_update:
+                systepacketmgr.update_or_install(package_name)
+                if post_fix:
+                    post_fix()
+            cprint('%s' % CHARACTERS.check, color='green')
+        except Exception as exp:
+            cprint('   - ERROR: cannot install the prerequite %s from the system. Please install it manually' % package_name, color='red')
+            sys.exit(2)
+
+# windows black magic: we ned pywin32
+if os.name == 'nt':
+    try:
+        import win32api
+    except ImportError:
+        # No win32api, try to install it, but setup() seems to fail, so call pip for this
+        from opsbro.util import exec_command
+        
+        cprint('   - Prerequite for ', color='grey', end='')
+        cprint(system_distro, color='magenta', end='')
+        cprint(' : ', color='grey', end='')
+        cprint('%-20s' % 'pyiwin32', color='blue', end='')
+        cprint('       from pypi  : ', color='grey', end='')
+        sys.stdout.flush()
+        
+        python_exe = os.path.abspath(sys.executable)
+        
+        # We need both pyiwin32 & pywin32 to works
+        # But lastest pywin32 on pypi do not support 3.4, cannot install in automagic
+        if PY3 and sys.version_info.minor == 4:  # == 3.4
+            cprint('ERROR: the python 3.4 is not managed under windows for automatic installaiton, please install pywin32 first (no more available on pypi for this python version).')
+            sys.exit(2)
+        for windows_package in ('pypiwin32', 'pywin32'):
+            pip_install_command = '%s -m pip install --only-binary %s %s' % (python_exe, windows_package, windows_package)
+            try:
+                rc, stdout, stderr = exec_command(pip_install_command)
+            except Exception as exp:
+                cprint('ERROR: cannot install %s: %s' % (windows_package, exp), color='red')
+                sys.exit(2)
+            if rc != 0:
+                cprint('ERROR: cannot install %s: %s' % (windows_package, stdout + stderr), color='red')
+                sys.exit(2)
+        
+        # Now need also to run the python Scripts\pywin32_postinstall.py -install script to register DLL. (I love windows...)
+        dll_script = os.path.join(os.path.dirname(python_exe), 'Scripts', 'pywin32_postinstall.py')
+        if not os.path.exists(dll_script):
+            cprint('ERROR: the pywin32 script to register the DLL is missing. Please install pywin32 manually', color='red')
+            sys.exit(2)
+        
+        dll_registering = '%s %s -install' % (python_exe, dll_script)
+        try:
+            rc, stdout, stderr = exec_command(dll_registering)
+        except Exception as exp:
+            cprint('ERROR: cannot install pyiwin32 dlls: %s' % exp, color='red')
+            sys.exit(2)
+        if rc != 0:
+            cprint('ERROR: cannot install pyiwin32dlls: %s' % (stdout + stderr))
+            sys.exit(2)
+        cprint('%s' % CHARACTERS.check, color='green')
+
+# Remove duplicate from pip install
 install_from_pip = set(install_from_pip)
 
 # if we are uploading to pypi, we don't want to have dependencies, I don't want pip to do black magic. I already do black magic.
 if not allow_black_magic:
+    install_from_pip = set()
+
+# HACK: debian 6 do not allow any more pypi install, sorry :'(
+if system_distro == 'debian' and system_distroversion.startswith('6.'):
     install_from_pip = set()
 
 # Try to import setup tools, and if not, switch to
@@ -484,18 +645,25 @@ except ImportError:
     try:
         cprint(' * You are missing the python setuptools, trying to install it with system package:', end='')
         sys.stdout.flush()
-        systepacketmgr.install_package('python-setuptools')
+        default_setuptools_pkg = 'python-setuptools'
+        if PY3:
+            default_setuptools_pkg = 'python3-setuptools'
+        package_name = setuptools_package_exceptions.get(system_distro, default_setuptools_pkg)
+        systepacketmgr.install_package(package_name)
         cprint(' %s' % CHARACTERS.check, color='green')
         from setuptools import setup, find_packages
-    except Exception, exp:
+    except Exception as exp:
         cprint('Cannot install python setuptools from system (%s). Cannot continue the installation. Please install python-setuptools before re-run the installation.' % exp, color='red')
         sys.exit(2)
 
-print '\n'
+print('\n')
 ##################################       Go install the python part
 if allow_black_magic:
     title = 'Python lib installation ' + sprintf('(2/3)', color='magenta', end='')
     print_h1(title, raw_title=True)
+    
+    if install_from_pip:
+        cprint('  * %s packages will be installed from Pypi (%s)' % (len(install_from_pip), ', '.join(install_from_pip)))
     
     cprint('  * %s opsbro python lib in progress...' % what, end='')
 sys.stdout.flush()
@@ -554,7 +722,7 @@ try:
         # Maybe some system need specific packages address on pypi, like add httpS on debian 6 :'(
         dependency_links=additionnal_pypi_repos,
     )
-except Exception, exp:
+except Exception as exp:
     print_fail_setup(exp)
     sys.exit(2)
 
@@ -568,15 +736,18 @@ unhook_stdout()
 if allow_black_magic:
     cprint('  %s' % CHARACTERS.check, color='green')
 
-installation_log = '/tmp/opsbro.setup.log'
+installation_log = '/tmp/opsbro.setup.log' if os.name != 'nt' else r'c:\opsbro.setup.log'
 with open(installation_log, 'w') as f:
     f.write(stdout_catched.getvalue())
     if allow_black_magic:
         cprint('   - Raw python setup lib (and possible dependencies) installation log at: %s' % installation_log, color='grey')
+        f = open(installation_log)
+        cprint(f.read())
+        f.close()
 
 ##################################       Install init.d script, the daemon script and bash completion part
 if allow_black_magic:
-    print '\n'
+    print('\n')
     title = 'Utility script installation ' + sprintf('(3/3)', color='magenta', end='')
     print_h1(title, raw_title=True)
 
@@ -595,12 +766,12 @@ def __do_install_files(lst):
         # Be sute the directory do exist
         if not os.path.exists(dir):
             # ==> mkdir -p
-            logger.debug('The directory %s is missing, creating it' % dir)
+            core_logger.debug('The directory %s is missing, creating it' % dir)
             os.makedirs(dir)
         for lfile in lfiles:
             lfile_name = os.path.basename(lfile)
             destination = os.path.join(dir, lfile_name)
-            logger.debug("Copying local file %s into %s" % (lfile, destination))
+            core_logger.debug("Copying local file %s into %s" % (lfile, destination))
             shutil.copy2(lfile, destination)
 
 
@@ -637,10 +808,21 @@ if not root and is_install and allow_black_magic:
         _chmodplusx(dest)
         __print_sub_install_part('bash completion rule')
 
+if not root and is_update and allow_black_magic:
+    cprint(' * Updating core configuration files')
+    __print_sub_install_part('Core packs')
+    core_configuration_dir = os.path.join(default_paths['var'], 'core-configuration')
+    shutil.rmtree(core_configuration_dir)
+    __do_install_files(configuration_files)
+
 if allow_black_magic:
-    print ''
+    print('')
     print_h1('End', raw_title=True)
     cprint('OpsBro ', end='')
     cprint(what, color='magenta', end='')
     cprint(' : ', end='')
     cprint(' %s' % CHARACTERS.check, color='green')
+    
+    cprint('  %s Notes: ' % CHARACTERS.corner_bottom_left, color='grey')
+    cprint('     - you can now start your daemon with:  service opsbro start', color='grey')
+    cprint('     - you can look at all available with:  opsbro -h', color='grey')

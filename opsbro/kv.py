@@ -1,21 +1,19 @@
 import os
-import json
 import time
 import threading
-import shutil
-import hashlib
 import socket
 
-from opsbro.httpclient import get_http_exceptions, httper
-from opsbro.stats import STATS
-from opsbro.log import LoggerFactory
-from opsbro.threadmgr import threader
-from opsbro.now import NOW
-from opsbro.dbwrapper import dbwrapper
-from opsbro.httpdaemon import response, http_export, abort, request
-from opsbro.gossip import gossiper
-from opsbro.library import libstore
-from opsbro.stop import stopper
+from .httpclient import get_http_exceptions, httper
+from .log import LoggerFactory
+from .now import NOW
+from .dbwrapper import dbwrapper
+from .gossip import gossiper
+from .library import libstore
+from .stop import stopper
+from .util import get_sha1_hash
+from .jsonmgr import jsoner
+from .ttldatabase import TTLDatabase
+from .udprouter import udprouter
 
 REPLICATS = 1
 
@@ -23,107 +21,8 @@ REPLICATS = 1
 logger = LoggerFactory.create_logger('key-value')
 
 
-# This class manage the ttl entries for each key with a ttl. Each is with a 1hour precision idx key that we saved
-# in the master db
-# but with keeping a database by hour about the key for the housekeeping
-class TTLDatabase(object):
-    def __init__(self, ttldb_dir):
-        self.lock = threading.RLock()
-        self.dbs = {}
-        self.db_cache_size = 100
-        self.ttldb_dir = ttldb_dir
-        if not os.path.exists(self.ttldb_dir):
-            os.mkdir(self.ttldb_dir)
-        # Launch a thread that will look once a minute the old entries
-        threader.create_and_launch(self.ttl_cleaning_thread, name='Cleaning TTL expired key/values', essential=True, part='key-value')
-    
-    
-    # Load the hour ttl/H base where we will save all master
-    # key for the H hour
-    def get_ttl_db(self, h):
-        cdb = self.dbs.get(h, None)
-        # If missing, look to load it but with a lock to be sure we load it only once
-        if cdb is None:
-            STATS.incr('ttl-db-cache-miss', 1)
-            with self.lock:
-                # Maybe during the lock get one other thread succedd in getting the cdb
-                if not h in self.dbs:
-                    # Ok really load it, but no more than self.db_cache_size
-                    # databases (number of open files can increase quickly)
-                    if len(self.dbs) > self.db_cache_size:
-                        ttodrop = self.dbs.keys()[0]
-                        del self.dbs[ttodrop]
-                    _t = time.time()
-                    cdb = dbwrapper.get_db(os.path.join(self.ttldb_dir, '%d' % h))  # leveldb.LevelDB(os.path.join(self.ttldb_dir, '%d' % h))
-                    STATS.incr('ttl-db-open', time.time() - _t)
-                    self.dbs[h] = cdb
-                # Ok a malicious thread just go before us, good :)
-                else:
-                    cdb = self.dbs[h]
-        # We alrady got it, thanks cache
-        else:
-            STATS.incr('ttl-db-cache-hit', 1)
-        return cdb
-    
-    
-    # Save a key in the good idx minute database
-    def set_ttl(self, key, ttl_t):
-        # keep keys saved by hour in the future
-        ttl_t = divmod(ttl_t, 3600)[0] * 3600
-        
-        cdb = self.get_ttl_db(ttl_t)
-        logger.debug("TTL save", key, "with ttl", ttl_t, "in", cdb)
-        cdb.Put(key, '')
-    
-    
-    # We already droped all entry in a db, so drop it from our cache
-    def drop_db(self, h):
-        # now remove the database
-        with self.lock:
-            try:
-                del self.dbs[h]
-            except (IndexError, KeyError):  # if not there, not a problem...
-                pass
-        
-        # And remove the files of this database
-        p = os.path.join(self.ttldb_dir, '%d' % h)
-        logger.log("Deleting ttl database tree", p)
-        shutil.rmtree(p, ignore_errors=True)
-    
-    
-    # Look at the available dbs and clean all olds dbs that time are lower
-    # than current hour
-    def clean_old(self):
-        logger.debug("TTL clean old")
-        now = NOW.now + 3600
-        h = divmod(now, 3600)[0] * 3600
-        # Look at the databses directory that have the hour time set
-        subdirs = os.listdir(self.ttldb_dir)
-        
-        for d in subdirs:
-            try:
-                bhour = int(d)
-            except ValueError:  # who add a dir that is not a int here...
-                continue
-            # Is the hour available for cleaning?
-            if bhour < h:
-                logger.log("TTL bhour is too low!", bhour)
-                # take the database and dump all keys in it
-                cdb = self.get_ttl_db(bhour)
-                to_del = cdb.RangeIter()
-                # Now ask the cluster to delete the key, whatever it is
-                for (k, v) in to_del:
-                    kvmgr.delete(k)
-                
-                # now we clean all old entries, remove the idx database
-                self.drop_db(bhour)
-    
-    
-    # Thread that will manage the delete of the ttld-die key
-    def ttl_cleaning_thread(self):
-        while True:
-            time.sleep(5)
-            self.clean_old()
+class KV_PACKET_TYPES(object):
+    PUT = 'kv::put'
 
 
 # Main KV backend. Reply on a local leveldb database. It's up to the
@@ -145,13 +44,16 @@ class KVBackend:
         
         # Massif send KV
         self.put_key_buffer = []
+        
+        # Set myself as master of the raft:: udp messages
+        udprouter.declare_handler('kv', self)
     
     
     # Really load data dir and so open database
     def init(self, data_dir):
         self.data_dir = data_dir
         self.db_dir = os.path.join(data_dir, 'kv')
-        self.db = dbwrapper.get_db(self.db_dir)  # leveldb.LevelDB(self.db_dir)
+        self.db = dbwrapper.get_db(self.db_dir)
         self.ttldb = TTLDatabase(os.path.join(data_dir, 'ttl'))
         
         # We can now export our http interface
@@ -159,7 +61,22 @@ class KVBackend:
     
     
     def get_info(self):
-        return {'stats': self.db.GetStats()}
+        r = {'stats': self.db.GetStats(), 'backend': {}}
+        if self.db:
+            r['backend']['name'] = self.db.name
+        return r
+    
+    
+    # We did receive a UDP packet
+    def manage_message(self, message_type, message, source_addr):
+        if message_type == KV_PACKET_TYPES.PUT:
+            k = message['k']
+            v = message['v']
+            fw = message.get('fw', False)
+            # For perf data we allow the udp send
+            self.put_key(k, v, allow_udp=True, fw=fw)
+        else:
+            logger.error('We do not manage such type of udp message: %s' % message_type)
     
     
     # We will open a file with the keys writen during a minute
@@ -206,7 +123,7 @@ class KVBackend:
         # like modification index
         metakey = '__meta/%s' % key
         try:
-            metavalue = json.loads(self.db.Get(metakey))
+            metavalue = jsoner.loads(self.db.Get(metakey))
         except (ValueError, KeyError):
             metavalue = {'modify_index': 0, 'modify_time': 0}
         
@@ -255,7 +172,7 @@ class KVBackend:
         if v is None:
             return v
         try:
-            return json.loads(v)
+            return jsoner.loads(v)
         except ValueError:
             return None
     
@@ -265,7 +182,7 @@ class KVBackend:
         metakey = '__meta/%s' % key
         metadata = meta
         if isinstance(meta, dict):
-            metadata = json.dumps(meta)
+            metadata = jsoner.dumps(meta)
         self.db.Put(metakey, metadata)
     
     
@@ -276,7 +193,7 @@ class KVBackend:
         
         r = []
         for (mkey, metaraw) in _all:
-            meta = json.loads(metaraw)
+            meta = jsoner.loads(metaraw)
             
             # maybe this key is too old to be interesting
             if meta['modify_time'] <= t:
@@ -298,7 +215,7 @@ class KVBackend:
     # put from udp should be clean quick from the thread so it can listen to udp again and
     # not lost any udp message
     def put_key_reaper(self):
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             put_key_buffer = self.put_key_buffer
             self.put_key_buffer = []
             _t = time.time()
@@ -320,7 +237,7 @@ class KVBackend:
         for (ukey, v, meta) in to_merge:
             metakey = '__meta/%s' % ukey
             try:
-                lmeta = json.loads(self.db.Get(metakey))
+                lmeta = jsoner.loads(self.db.Get(metakey))
             except KeyError:
                 continue
             # If the other mod_index is higer, we import it :)
@@ -335,7 +252,7 @@ class KVBackend:
         # we have to compute our internal key mapping. For user key it's: /data/KEY
         key = ukey
         
-        hkey = hashlib.sha1(key).hexdigest()
+        hkey = get_sha1_hash(key)
         nuuid = gossiper.find_group_node('kv', hkey)
         logger.debug('KV: DELETE node that manage the key %s' % nuuid)
         # that's me :)
@@ -354,7 +271,7 @@ class KVBackend:
                 httper.delete(uri)
                 logger.debug('KV: DELETE return')
                 return None
-            except get_http_exceptions(), exp:
+            except get_http_exceptions() as exp:
                 logger.debug('KV: DELETE error asking to %s: %s' % (n['name'], str(exp)))
                 return None
     
@@ -363,7 +280,7 @@ class KVBackend:
     def get_key(self, ukey):
         # we have to compute our internal key mapping. For user key it's: /data/KEY
         key = ukey
-        hkey = hashlib.sha1(key).hexdigest()
+        hkey = get_sha1_hash(key)
         nuuid = gossiper.find_group_node('kv', hkey)
         logger.info('KV: key %s is managed by %s' % (ukey, nuuid))
         # that's me :)
@@ -386,7 +303,7 @@ class KVBackend:
                     return None
                 logger.info('KV: get founded (%d)' % len(r))
                 return r
-            except get_http_exceptions(), exp:
+            except get_http_exceptions() as exp:
                 logger.error('KV: error asking to %s: %s' % (n['name'], str(exp)))
                 return None
     
@@ -395,7 +312,7 @@ class KVBackend:
         # we have to compute our internal key mapping. For user key it's: /data/KEY
         key = ukey
         
-        hkey = hashlib.sha1(key).hexdigest()
+        hkey = get_sha1_hash(key)
         
         nuuid = gossiper.find_group_node('kv', hkey)
         
@@ -432,8 +349,8 @@ class KVBackend:
             # Maybe the user did allow weak consistency, so we can use udp (like metrics)
             if allow_udp:
                 try:
-                    payload = {'type': '/kv/put', 'k': ukey, 'v': value, 'ttl': ttl, 'fw': True}
-                    packet = json.dumps(payload)
+                    payload = {'type': KV_PACKET_TYPES.PUT, 'k': ukey, 'v': value, 'ttl': ttl, 'fw': True}
+                    packet = jsoner.dumps(payload)
                     encrypter = libstore.get_encrypter()
                     enc_packet = encrypter.encrypt(packet)
                     logger.debug('KV: PUT(udp) asking %s: %s:%s' % (n['name'], n['addr'], n['port']))
@@ -441,18 +358,18 @@ class KVBackend:
                     sock.sendto(enc_packet, (n['addr'], n['port']))
                     sock.close()
                     return None
-                except Exception, exp:
+                except Exception as exp:
                     logger.debug('KV: PUT (udp) error asking to %s: %s' % (n['name'], str(exp)))
                     return None
             # ok no allow udp here, so we switch to a classic HTTP mode :)
             uri = 'http://%s:%s/kv/%s' % (n['addr'], n['port'], ukey)
             try:
                 logger.debug('KV: PUT asking %s: %s' % (n['name'], uri))
-                params = {'ttl': str(ttl)}
+                params = {'ttl': ttl}
                 httper.put(uri, data=value, params=params)
                 logger.debug('KV: PUT return')
                 return None
-            except get_http_exceptions(), exp:
+            except get_http_exceptions() as exp:
                 logger.debug('KV: PUT error asking to %s: %s' % (n['name'], str(exp)))
                 return None
     
@@ -492,7 +409,7 @@ class KVBackend:
     
     def do_replication_backlog_thread(self):
         logger.log('REPLICATION thread launched')
-        while not stopper.interrupted:
+        while not stopper.is_stop():
             # Standard switch
             replication_backlog = self.replication_backlog
             self.replication_backlog = {}
@@ -500,7 +417,7 @@ class KVBackend:
             replicats = self.get_my_replicats()
             if len(replicats) == 0:
                 time.sleep(1)
-            for (ukey, bl) in replication_backlog.iteritems():
+            for (ukey, bl) in replication_backlog.items():
                 # REF: bl = {'value':(ukey, value), 'repl':[], 'hkey':hkey, 'meta':meta}
                 _, value = bl['value']
                 for uuid in replicats:
@@ -515,10 +432,10 @@ class KVBackend:
                     uri = 'http://%s:%s/kv/%s' % (n['addr'], n['port'], ukey)
                     try:
                         logger.debug('KV: PUT(force) asking %s: %s' % (n['name'], uri))
-                        params = {'force': True, 'meta': json.dumps(bl['meta'])}
+                        params = {'force': True, 'meta': jsoner.dumps(bl['meta'])}
                         r = httper.put(uri, data=value, params=params)
                         logger.debug('KV: PUT(force) return %s' % r)
-                    except get_http_exceptions(), exp:
+                    except get_http_exceptions() as exp:
                         logger.debug('KV: PUT(force) error asking to %s: %s' % (n['name'], str(exp)))
             time.sleep(1)
     
@@ -526,19 +443,21 @@ class KVBackend:
     # main method to export http interface. Must be in a method that got
     # a self entry
     def export_http(self):
+        from .httpdaemon import response, http_export, abort, request
+        
         @http_export('/kv/')
         @http_export('/kv')
         def list_keys():
             response.content_type = 'application/json'
             l = list(self.db.RangeIter(include_value=False))
-            return json.dumps(l)
+            return jsoner.dumps(l)
         
         
         @http_export('/kv-meta/changed/:t', method='GET')
         def changed_since(t):
             response.content_type = 'application/json'
             t = int(t)
-            return json.dumps(self.changed_since(t))
+            return jsoner.dumps(self.changed_since(t))
         
         
         @http_export('/kv/:ukey#.+#', method='GET')
@@ -566,7 +485,7 @@ class KVBackend:
             force = request.GET.get('force', 'False') == 'True'
             meta = request.GET.get('meta', None)
             if meta:
-                meta = json.loads(meta)
+                meta = jsoner.loads(meta)
             ttl = int(request.GET.get('ttl', '0'))
             self.put_key(ukey, value, force=force, meta=meta, ttl=ttl)
             return
