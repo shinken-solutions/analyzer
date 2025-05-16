@@ -9,13 +9,12 @@ import stat
 import optparse
 import shutil
 import imp
-from cStringIO import StringIO
+from io import StringIO
 from glob import glob
 import atexit
 from distutils.core import setup
 from setuptools import find_packages
 import py2exe
-
 
 # We have some warnings because we reimport some libs. We don't want them to be shown at install
 import warnings
@@ -27,42 +26,34 @@ def _disable_warns(*args, **kwargs):
 
 warnings.showwarning = _disable_warns
 
-# will fail under 2.5 python version, but if really you have such a version in
-# prod you are a morron and we can't help you
-python_version = sys.version_info
-if python_version < (2, 6):
-    sys.exit("OpsBro require as a minimum Python 2.6, sorry")
-elif python_version >= (3,):
-    sys.exit("OpsBro is not yet compatible with Python 3.x, sorry")
-
 package_data = ['*.py']
 
-# Is this setup.py call for a pypi interaction? if true, won't hook lot of things
+# Is this setup.py call for a pypi interaction? if true, won't hook a lot of things
 is_pypi_register_upload = ('register' in sys.argv or ('sdist' in sys.argv and 'upload' in sys.argv))
 if is_pypi_register_upload:
-    print("Pypi specal mode activated, skipping some black magic")
+    print("Pypi special mode activated, skipping some black magic")
     if '-v' not in sys.argv:
         sys.argv.append('-v')
 
 # Is it a first step installation for pip? (egg_info stuff)
 is_pip_first_step = 'egg_info' in sys.argv
-# Last step for pip insta an install one (at least in pip 9.0.1)
+# Last step for pip insta an installation one (at least in pip 9.0.1)
 is_pip_real_install_step = 'bdist_wheel' in sys.argv
 
 # Black magic install:
 # * copy /etc
 # * look for dependencies from system packages
 # * hide setup.py part
-# If not blac kmagic (like in pip first step, or pypi interaction (upload, etc)
+# If not black magic (like in pip first step, or pypi interaction (upload, etc)
 # we do not want any black magic thing, and we try to behave like a standard python package ^^
 # By default we love black magic, but if we are in a pip special call or pypi, we disable it
-allow_black_magic = False #not is_pypi_register_upload and not is_pip_first_step
+allow_black_magic = False  # not is_pypi_register_upload and not is_pip_first_step
 
 # We will need to allow a debug of the orig_sys_argv
 orig_sys_argv = sys.argv[:]
 
 
-##################################       Utility functions for files
+# -------------------------- Utility functions for files
 # helper function to read the README file
 def read(fname):
     return open(os.path.join(os.path.dirname(__file__), fname)).read()
@@ -85,13 +76,13 @@ def _chmodplusx(d):
         os.chmod(d, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-##################################       Hook the ugly python setup() call that can output gcc warnings.
+# -------------------------- Hook the ugly python setup() call that can output gcc warnings.
 # NOTE: yes, there is os.dup and file descriptor things. Deal with it (r).
 # Keep a trace of the old stdout, because setup() is just toooooooooo verbose when succeed
 stdout_orig = sys.stdout
 stderr_orig = sys.stderr
 stdout_catched = StringIO()
-stderr_redirect_path = '/tmp/stderr.opsbro.tmp' if os.name !='nt' else r'c:\stderr.opsbro.tmp'
+stderr_redirect_path = '/tmp/stderr.opsbro.tmp' if os.name != 'nt' else r'C:\dev\workspace\analyzer\stderr.opsbro.tmp'
 stderr_redirect = None
 stderr_orig_bkp = None
 
@@ -122,7 +113,7 @@ def unhook_stdout():
     sys.stderr = stderr_orig
 
 
-##################################       Parse arguments, especially for pip install arg catched
+# -------------------------- Parse arguments, especially for pip install arg catched
 parser = optparse.OptionParser("%prog [options]", version="%prog ")
 parser.add_option('--root', dest="proot", metavar="ROOT", help='Root dir to install, usefull only for packagers')
 parser.add_option('--upgrade', '--update', dest="upgrade", action='store_true', help='Only upgrade')
@@ -146,7 +137,7 @@ parser.error = old_error
 
 root = opts.proot or ''
 
-##################################       Detect install or Update
+# --------------------------Detect install or Update
 prev_version = None
 prev_path = ''
 # We try to see if we are in a full install or an update process
@@ -183,7 +174,7 @@ from opsbro.characters import CHARACTERS
 
 systepacketmgr = get_systepacketmgr()
 
-##################################       Only root as it's a global system tool.
+# -------------------------- Only root as it's a global system tool.
 if os.name != 'nt' and os.getuid() != 0:
     cprint('Setup must be launched as root.', color='red')
     sys.exit(2)
@@ -202,7 +193,7 @@ title = sprintf('%s' % what, color='magenta', end='') + sprintf(' OpsBro to vers
 if allow_black_magic:
     print_h1(title, raw_title=False)
 
-##################################       Start to print to the user
+# --------------------------Start to print to the user
 if allow_black_magic:
     # If we have a real tty, we can print the delicious banner with lot of BRO
     if is_tty():
@@ -512,7 +503,7 @@ atexit.register(print_fail_setup)
 
 try:
     setup(
-    	console=['bin/opsbro'],
+        console=['bin/opsbro'],
         name="opsbro",
         version=VERSION,
         packages=find_packages(),
@@ -546,11 +537,12 @@ try:
         # Maybe some system need specific packages address on pypi, like add httpS on debian 6 :'(
         dependency_links=additionnal_pypi_repos,
         options={
-                "py2exe":{
-                        #"unbuffered": True,
-                        #"optimize": 2,
-                        "includes": ["win32serviceutil", "win32event", 'commands', 'multiprocessing']
-                }
+            "py2exe": {
+                # "unbuffered": True,
+                # "optimize": 2,
+                # "includes": ["win32serviceutil", "win32event", 'commands', 'multiprocessing'],
+                "includes": ["win32serviceutil", "win32event", 'multiprocessing']
+            }
         }
     )
 except Exception as exp:
@@ -567,7 +559,7 @@ unhook_stdout()
 if allow_black_magic:
     cprint('  %s' % CHARACTERS.check, color='green')
 
-installation_log = '/tmp/opsbro.setup.log' if os.name !='nt' else r'c:\opsbro.setup.log'
+installation_log = '/tmp/opsbro.setup.log' if os.name != 'nt' else r'C:\dev\workspace\analyzer\opsbro.setup.log'
 with open(installation_log, 'w') as f:
     f.write(stdout_catched.getvalue())
     if allow_black_magic:
