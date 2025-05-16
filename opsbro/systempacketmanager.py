@@ -1,5 +1,4 @@
 import os
-import platform
 
 from .log import LoggerFactory
 
@@ -27,12 +26,21 @@ from .system_backends.system_backend_yum import YumBackend
 from .system_backends.system_backend_zypper import ZypperBackend
 
 
+def get_linux_distribution():
+    try:
+        import platform
+        return platform.linux_distribution()
+    except (ImportError, AttributeError):
+        from .misc import distro
+        return distro.name(), distro.version(), distro.id()
+
+
 # Try to know in which system we are running (apt, yum, or other)
 # if cannot find a real backend, go to dummy that cannot find or install anything
 class SystemPacketMgr(object):
     def __init__(self):
         if os.name != 'nt':
-            (distname, distversion, distid) = platform.linux_distribution()
+            (distname, distversion, distid) = get_linux_distribution()
             distname = distname.lower().strip()
             distversion = distversion.lower().strip()
             distid = distid.lower().strip()
